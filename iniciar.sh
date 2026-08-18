@@ -39,12 +39,14 @@ else
 fi
 
 # ==============================================================================
-# 0.1 USUARIO ADMINISTRATIVO CON SUDO
+# 0.1 USUARIO ADMINISTRATIVO CON SUDO (elegible por parámetro o interactivo)
 # ==============================================================================
 echo "================================================="
 echo "👤 0.1 Configurando usuario administrativo..."
 echo "================================================="
 
+# Uso: ./iniciar.sh [usuario_sudo] [password_sudo]
+# Si no se pasan como parámetros, se piden por consola (requiere -t en ssh).
 SUDO_USER_NAME="$1"
 SUDO_USER_PASS="$2"
 
@@ -75,9 +77,11 @@ else
     fi
 fi
 
+# La contraseña se aplica siempre (exista o no el usuario) porque la acabas de indicar tú mismo
 echo "$SUDO_USER_NAME:$SUDO_USER_PASS" | $SUDO chpasswd
 echo "✅ Contraseña de '$SUDO_USER_NAME' establecida/actualizada."
 
+# Asegurar que el usuario actual y el usuario sudo elegido puedan correr docker sin sudo
 for U in "$USER" "$SUDO_USER_NAME"; do
     if ! id -nG "$U" 2>/dev/null | grep -qw docker; then
         $SUDO usermod -aG docker "$U" 2>/dev/null || true
@@ -85,10 +89,10 @@ for U in "$USER" "$SUDO_USER_NAME"; do
 done
 
 # ==============================================================================
-# 0.2/0.3 CLONAR/ACTUALIZAR REPOSITORIO Y AUTO-RELANZAR
+# 0.2/0.3 CLONAR/ACTUALIZAR REPOSITORIO (público, sin credenciales) Y AUTO-RELANZAR
 # ==============================================================================
-REPO_URL="https://github.com/LXA21/nexora"
-REPO_DIR="$HOME/nexora-repo"
+REPO_URL="https://github.com/LXA21/nexora.git"
+REPO_DIR="$HOME/nexoragit"
 
 SCRIPT_ACTUAL="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 
@@ -131,6 +135,8 @@ if [ -n "$ZIP_FILE" ]; then
     mkdir -p "$TMP_EXTRACT"
     unzip -oq "$ZIP_FILE" -d "$TMP_EXTRACT"
 
+    # Si el zip trae una única carpeta contenedora (ej: comanda-php/), aplanamos
+    # su contenido hacia la raíz del repo para que Dockerfile encuentre index.php, api/, etc.
     CONTENIDO_ZIP=($(ls -A "$TMP_EXTRACT"))
     if [ "${#CONTENIDO_ZIP[@]}" -eq 1 ] && [ -d "$TMP_EXTRACT/${CONTENIDO_ZIP[0]}" ]; then
         cp -rf "$TMP_EXTRACT/${CONTENIDO_ZIP[0]}/." "$REPO_DIR/"
@@ -141,7 +147,7 @@ if [ -n "$ZIP_FILE" ]; then
     rm -rf "$TMP_EXTRACT"
     echo "✅ Código fuente descomprimido en $REPO_DIR."
 else
-    echo "ℹ️  No se encontró ningún .zip en el repositorio."
+    echo "ℹ️  No se encontró ningún .zip en el repositorio. Se asume que el código ya está descomprimido."
 fi
 
 # ==============================================================================
@@ -158,6 +164,7 @@ fi
 docker container prune -f > /dev/null 2>&1 || true
 docker network prune -f > /dev/null 2>&1 || true
 echo "✅ Limpieza global previa completada."
+echo "ℹ️  Nota: se omite 'docker volume prune -a' para no afectar volúmenes de otros contenedores del servidor."
 
 # ==============================================================================
 # 1. CONFIGURACIÓN DE DIRECTORIO DE TRABAJO
@@ -168,7 +175,7 @@ DIR_PADRE="$(dirname "$RUTA_ORIGEN")"
 cd "$RUTA_ORIGEN"
 
 # ==============================================================================
-# 1.1 VERIFICACIÓN DEL CÓDIGO FUENTE
+# 1.1 VERIFICACIÓN DEL CÓDIGO FUENTE (ya viene del git clone/pull)
 # ==============================================================================
 echo "================================================="
 echo "📦 1.1 Verificando código fuente..."
@@ -178,17 +185,18 @@ if [ -f "$RUTA_ORIGEN/Dockerfile" ]; then
     echo "✅ Código fuente presente (Dockerfile encontrado en el repo)."
 else
     echo "⚠️  No se encontró Dockerfile en el repositorio clonado."
+    echo "   Si mi_p1_web:latest tampoco existe como imagen, el siguiente paso fallará."
 fi
 
 # ==============================================================================
-# 1.2 CONSTRUCCIÓN/ETIQUETADO DE IMÁGENES
+# 1.2 CONSTRUCCIÓN/ETIQUETADO DE IMÁGENES (solo si no existen ya)
 # ==============================================================================
 echo "================================================="
 echo "🏗️  1.2 Verificando imágenes Docker necesarias..."
 echo "================================================="
 
 if [ -f "$RUTA_ORIGEN/Dockerfile" ]; then
-    echo "🔨 Reconstruyendo mi_p1_web:latest desde $RUTA_ORIGEN..."
+    echo "🔨 Reconstruyendo mi_p1_web:latest desde $RUTA_ORIGEN (código actualizado del repo)..."
     docker image rm mi_p1_web:latest > /dev/null 2>&1 || true
     docker build -t mi_p1_web:latest "$RUTA_ORIGEN"
     echo "✅ mi_p1_web:latest reconstruida con el código más reciente."
@@ -198,7 +206,7 @@ else
 fi
 
 if ! docker image inspect mi_p1_mysql:latest > /dev/null 2>&1; then
-    echo "⬇️  mi_p1_mysql:latest no existe. Descargando..."
+    echo "⬇️  mi_p1_mysql:latest no existe. Descargando y etiquetando desde mariadb oficial..."
     docker pull mariadb:latest
     docker tag mariadb:latest mi_p1_mysql:latest
     echo "✅ mi_p1_mysql:latest lista."
@@ -207,7 +215,7 @@ else
 fi
 
 if ! docker image inspect mi_p1_pma:latest > /dev/null 2>&1; then
-    echo "⬇️  mi_p1_pma:latest no existe. Descargando..."
+    echo "⬇️  mi_p1_pma:latest no existe. Descargando y etiquetando desde phpmyadmin oficial..."
     docker pull phpmyadmin:latest
     docker tag phpmyadmin:latest mi_p1_pma:latest
     echo "✅ mi_p1_pma:latest lista."
@@ -268,6 +276,10 @@ export PUERTO_PMA
 export PUERTO_SSL
 export PREFIX_CONTENEDOR="${NOMBRE_CARPETA}"
 
+# Persistimos las variables en un .env dentro de la carpeta de la instancia.
+# Así, futuras sesiones SSH que solo hagan "docker compose down/up" en esta
+# carpeta (sin volver a correr este script) usarán siempre el mismo prefijo
+# y por lo tanto el mismo volumen de datos, evitando perder la base de datos.
 cat > .env <<EOF
 PUERTO_WEB=${PUERTO_WEB}
 PUERTO_DB=${PUERTO_DB}
@@ -287,57 +299,91 @@ docker compose up -d --force-recreate -V --remove-orphans
 # ==============================================================================
 # 5. ESPERA ACTIVA Y ASIGNACIÓN AUTOMÁTICA DE PERMISOS
 # ==============================================================================
+echo "⏳ 4. Esperando a que el motor de MySQL esté totalmente listo..."
 
-echo "⏳ Esperando a que el motor de MySQL esté totalmente listo..."
-until docker inspect -f '{{.State.Running}}' "${PREFIX_CONTENEDOR}_db" 2>/dev/null | grep -q "true" && \
-      docker exec "${PREFIX_CONTENEDOR}_db" mysqladmin ping -h 127.0.0.1 -u root --silent > /dev/null 2>&1; do
+until docker exec "${NOMBRE_CARPETA}_mysql" mysqladmin ping -u root -proot --silent > /dev/null 2>&1; do
     echo "   ... MySQL aún se está inicializando, esperando 2 segundos más..."
     sleep 2
 done
-echo "⚡ MySQL detectado y listo. Verificando autenticación de root..."
 
-if docker exec "${NOMBRE_CARPETA}_db" mysql -u root -e "SELECT 1;" > /dev/null 2>&1; then
-    echo "   ✅ root autenticado sin contraseña."
-else
-    echo "❌ No se pudo autenticar como root en MySQL."
+echo "⚡ MySQL detectado y listo. Detectando método de autenticación de root..."
+
+# Algunas imágenes MySQL/MariaDB dejan a root@localhost autenticado por
+# socket UNIX (sin contraseña real) en vez de por la contraseña definida
+# en MYSQL_ROOT_PASSWORD. Probamos ambos métodos con reintentos cortos
+# para evitar fallos por timing justo después del healthcheck.
+MYSQL_ROOT_AUTH=""
+for intento in 1 2 3 4 5; do
+    if docker exec "${NOMBRE_CARPETA}_mysql" mysql -u root -e "SELECT 1;" > /dev/null 2>&1; then
+        MYSQL_ROOT_AUTH="sin_password"
+        echo "   ✅ root autenticado sin contraseña (socket)."
+        break
+    elif docker exec "${NOMBRE_CARPETA}_mysql" mysql -u root -proot -e "SELECT 1;" > /dev/null 2>&1; then
+        MYSQL_ROOT_AUTH="con_password"
+        echo "   ✅ root autenticado con contraseña."
+        break
+    fi
+    echo "   ... intento $intento fallido, reintentando en 2s..."
+    sleep 2
+done
+
+if [ -z "$MYSQL_ROOT_AUTH" ]; then
+    echo "❌ No se pudo autenticar como root en MySQL tras varios intentos."
+    echo "   Revisa la imagen 'mi_p1_mysql' (posible auth_socket fijo o build corrupto)."
     exit 1
 fi
 
 # ==============================================================================
-# 4.1 IMPORTACIÓN DEL ESQUEMA Y CREACIÓN DEL USUARIO
+# 4.1 IMPORTACIÓN DEL ESQUEMA (solo si la base de datos 'comanda' está vacía)
 # ==============================================================================
 echo "================================================="
-echo "📜 4.1 Verificando/Importando esquema de 'sistema_facturacion' (database.sql)..."
+echo "📜 4.1 Verificando/Importando esquema de 'comanda' (database/full.sql)..."
 echo "================================================="
 
-FULL_SQL="$RUTA_ORIGEN/database.sql"
+FULL_SQL="$RUTA_ORIGEN/database/full.sql"
 
 if [ ! -f "$FULL_SQL" ]; then
     echo "❌ No se encontró $FULL_SQL. Abortando importación de esquema."
     exit 1
 fi
 
-# Asegurar la creación de la base de datos por si no se creó automáticamente
-# Asegurar la creación de la base de datos por si no se creó automáticamente
-docker exec "${NOMBRE_CARPETA}_db" mysql -h 127.0.0.1 -u root -e "CREATE DATABASE IF NOT EXISTS sistema_facturacion;"
-
-TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mysql -h 127.0.0.1 -u root -N -B \
-    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='sistema_facturacion';" 2>/dev/null || echo "0")
-
-if [ "$TABLAS_EXISTENTES" = "0" ] || [ "$TABLAS_EXISTENTES" = "" ]; then
-    echo "⚙️  Base de datos vacía. Importando esquema y datos iniciales desde database.sql..."
-    docker exec -i "${NOMBRE_CARPETA}_db" mysql -h 127.0.0.1 -u root sistema_facturacion < "$FULL_SQL"
-    echo "✅ Esquema y datos importados correctamente."
+if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
+    TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_mysql" mysql -u root -N -B \
+        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='comanda' AND table_name='company_info';" 2>/dev/null || echo "0")
 else
-    echo "✅ El esquema ya existe. Se omite importación para no duplicar datos."
+    TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_mysql" mysql -u root -proot -N -B \
+        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='comanda' AND table_name='company_info';" 2>/dev/null || echo "0")
 fi
 
-echo "⚡ Otorgando permisos a 'comanda'..."
-docker exec "${NOMBRE_CARPETA}_db" mysql -u root -e \
-    "CREATE USER IF NOT EXISTS 'comanda'@'%' IDENTIFIED BY ''; \
-    GRANT ALL PRIVILEGES ON *.* TO 'comanda'@'%'; \
+if [ "$TABLAS_EXISTENTES" = "0" ]; then
+    echo "⚙️  Base de datos vacía. Importando esquema y datos iniciales desde full.sql..."
+    if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
+        docker exec -i "${NOMBRE_CARPETA}_mysql" mysql -u root comanda < "$FULL_SQL"
+    else
+        docker exec -i "${NOMBRE_CARPETA}_mysql" mysql -u root -proot comanda < "$FULL_SQL"
+    fi
+    echo "✅ Esquema y datos de ejemplo importados correctamente."
+else
+    echo "✅ El esquema ya existe (tabla 'company_info' detectada). Se omite importación para no duplicar datos."
+fi
+
+echo "⚡ Otorgando permisos a 'usuario_app'..."
+
+if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
+    docker exec "${NOMBRE_CARPETA}_mysql" mysql -u root -e \
+    "CREATE USER IF NOT EXISTS 'usuario_app'@'%' IDENTIFIED BY 'clave_usuario'; \
+    ALTER USER 'usuario_app'@'%' IDENTIFIED BY 'clave_usuario'; \
+    GRANT ALL PRIVILEGES ON *.* TO 'usuario_app'@'%'; \
     FLUSH PRIVILEGES;"
-echo "✅ Permisos de la base de datos otorgados correctamente al usuario 'comanda'."
+else
+    docker exec "${NOMBRE_CARPETA}_mysql" mysql -u root -proot -e \
+    "CREATE USER IF NOT EXISTS 'usuario_app'@'%' IDENTIFIED BY 'clave_usuario'; \
+    ALTER USER 'usuario_app'@'%' IDENTIFIED BY 'clave_usuario'; \
+    GRANT ALL PRIVILEGES ON *.* TO 'usuario_app'@'%'; \
+    FLUSH PRIVILEGES;"
+fi
+
+echo "✅ Permisos de la base de datos otorgados correctamente."
 
 # ==============================================================================
 # 6. REPORTE FINAL CON IP DINÁMICA
@@ -345,6 +391,7 @@ echo "✅ Permisos de la base de datos otorgados correctamente al usuario 'coman
 IP_SERVIDOR=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}')
 
 if [ -z "$IP_SERVIDOR" ]; then
+    # Respaldo: toma la primera IP que no sea de Docker (172.x) ni loopback (127.x)
     IP_SERVIDOR=$(hostname -I | tr ' ' '\n' | grep -vE '^172\.|^127\.' | head -n 1)
 fi
 
