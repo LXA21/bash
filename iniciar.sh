@@ -301,8 +301,8 @@ docker compose up -d --force-recreate -V --remove-orphans
 # ==============================================================================
 echo "⏳ 4. Esperando a que el motor de MySQL esté totalmente listo..."
 
-until docker exec "${NOMBRE_CARPETA}_db" mysqladmin ping -u root --silent > /dev/null 2>&1 || \
-      docker exec "${NOMBRE_CARPETA}_db" mysqladmin ping -u root -proot --silent > /dev/null 2>&1; do
+until docker exec "${NOMBRE_CARPETA}_db" mariadb-admin ping -u root --silent > /dev/null 2>&1 || \
+      docker exec "${NOMBRE_CARPETA}_db" mariadb-admin ping -u root -proot --silent > /dev/null 2>&1; do
     echo "   ... MySQL aún se está inicializando, esperando 2 segundos más..."
     sleep 2
 done
@@ -315,11 +315,11 @@ echo "⚡ MySQL detectado y listo. Detectando método de autenticación de root.
 # para evitar fallos por timing justo después del healthcheck.
 MYSQL_ROOT_AUTH=""
 for intento in 1 2 3 4 5; do
-    if docker exec "${NOMBRE_CARPETA}_db" mysql -u root -e "SELECT 1;" > /dev/null 2>&1; then
+    if docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -e "SELECT 1;" > /dev/null 2>&1; then
         MYSQL_ROOT_AUTH="sin_password"
         echo "   ✅ root autenticado sin contraseña (socket)."
         break
-    elif docker exec "${NOMBRE_CARPETA}_db" mysql -u root -proot -e "SELECT 1;" > /dev/null 2>&1; then
+    elif docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -proot -e "SELECT 1;" > /dev/null 2>&1; then
         MYSQL_ROOT_AUTH="con_password"
         echo "   ✅ root autenticado con contraseña."
         break
@@ -349,19 +349,19 @@ if [ ! -f "$FULL_SQL" ]; then
 fi
 
 if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
-    TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mysql -u root -N -B \
+    TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -N -B \
         -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='sistema_facturacion' AND table_name='usuarios';" 2>/dev/null || echo "0")
 else
-    TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mysql -u root -proot -N -B \
+    TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -proot -N -B \
         -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='sistema_facturacion' AND table_name='usuarios';" 2>/dev/null || echo "0")
 fi
 
 if [ "$TABLAS_EXISTENTES" = "0" ]; then
     echo "⚙️  Base de datos vacía. Importando esquema y datos iniciales desde sistema_facturacion.sql..."
     if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
-        docker exec -i "${NOMBRE_CARPETA}_db" mysql -u root sistema_facturacion < "$FULL_SQL"
+        docker exec -i "${NOMBRE_CARPETA}_db" mariadb -u root sistema_facturacion < "$FULL_SQL"
     else
-        docker exec -i "${NOMBRE_CARPETA}_db" mysql -u root -proot sistema_facturacion < "$FULL_SQL"
+        docker exec -i "${NOMBRE_CARPETA}_db" mariadb -u root -proot sistema_facturacion < "$FULL_SQL"
     fi
     echo "✅ Esquema y datos de ejemplo importados correctamente."
 else
@@ -371,13 +371,13 @@ fi
 echo "⚡ Creando/otorgando permisos al usuario 'comanda' (sin contraseña)..."
 
 if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
-    docker exec "${NOMBRE_CARPETA}_db" mysql -u root -e \
+    docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -e \
     "CREATE USER IF NOT EXISTS 'comanda'@'%' IDENTIFIED BY ''; \
     ALTER USER 'comanda'@'%' IDENTIFIED BY ''; \
     GRANT ALL PRIVILEGES ON *.* TO 'comanda'@'%' WITH GRANT OPTION; \
     FLUSH PRIVILEGES;"
 else
-    docker exec "${NOMBRE_CARPETA}_db" mysql -u root -proot -e \
+    docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -proot -e \
     "CREATE USER IF NOT EXISTS 'comanda'@'%' IDENTIFIED BY ''; \
     ALTER USER 'comanda'@'%' IDENTIFIED BY ''; \
     GRANT ALL PRIVILEGES ON *.* TO 'comanda'@'%' WITH GRANT OPTION; \
