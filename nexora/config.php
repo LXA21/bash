@@ -1,5 +1,5 @@
 <?php
-define('DB_HOST', '127.0.0.1');
+define('DB_HOST', 'db');
 define('DB_NAME', 'sistema_facturacion');
 define('DB_USER', 'comanda');
 define('DB_PASS', '');
