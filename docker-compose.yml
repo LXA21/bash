@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   app:
-    build: .
+    image: mi_p1_web:latest
     container_name: ${PREFIX_CONTENEDOR}_app
     restart: unless-stopped
     network_mode: host
