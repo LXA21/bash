@@ -301,7 +301,8 @@ docker compose up -d --force-recreate -V --remove-orphans
 # ==============================================================================
 echo "⏳ 4. Esperando a que el motor de MySQL esté totalmente listo..."
 
-until docker exec "${NOMBRE_CARPETA}_db" mysqladmin ping -u root -proot --silent > /dev/null 2>&1; do
+until docker exec "${NOMBRE_CARPETA}_db" mysqladmin ping -u root --silent > /dev/null 2>&1 || \
+      docker exec "${NOMBRE_CARPETA}_db" mysqladmin ping -u root -proot --silent > /dev/null 2>&1; do
     echo "   ... MySQL aún se está inicializando, esperando 2 segundos más..."
     sleep 2
 done
