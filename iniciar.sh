@@ -318,14 +318,15 @@ if [ ! -f "$FULL_SQL" ]; then
 fi
 
 # Asegurar la creación de la base de datos por si no se creó automáticamente
-docker exec "${NOMBRE_CARPETA}_db" mysql -u root -e "CREATE DATABASE IF NOT EXISTS sistema_facturacion;"
+# Asegurar la creación de la base de datos por si no se creó automáticamente
+docker exec "${NOMBRE_CARPETA}_db" mysql -h 127.0.0.1 -u root -e "CREATE DATABASE IF NOT EXISTS sistema_facturacion;"
 
-TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mysql -u root -N -B \
+TABLAS_EXISTENTES=$(docker exec "${NOMBRE_CARPETA}_db" mysql -h 127.0.0.1 -u root -N -B \
     -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='sistema_facturacion';" 2>/dev/null || echo "0")
 
 if [ "$TABLAS_EXISTENTES" = "0" ] || [ "$TABLAS_EXISTENTES" = "" ]; then
     echo "⚙️  Base de datos vacía. Importando esquema y datos iniciales desde database.sql..."
-    docker exec -i "${NOMBRE_CARPETA}_db" mysql -u root sistema_facturacion < "$FULL_SQL"
+    docker exec -i "${NOMBRE_CARPETA}_db" mysql -h 127.0.0.1 -u root sistema_facturacion < "$FULL_SQL"
     echo "✅ Esquema y datos importados correctamente."
 else
     echo "✅ El esquema ya existe. Se omite importación para no duplicar datos."
