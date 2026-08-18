@@ -335,6 +335,40 @@ if [ -z "$MYSQL_ROOT_AUTH" ]; then
 fi
 
 # ==============================================================================
+# 4.0 ESPERA DE LA BASE DE DATOS REAL (evita condición de carrera con el
+#     servidor temporal que usan las imágenes MySQL/MariaDB para inicializar)
+# ==============================================================================
+# El "ping" anterior puede responder exitosamente contra el servidor TEMPORAL
+# que la imagen usa internamente para crear MYSQL_DATABASE, antes de que esa
+# base de datos exista realmente. Aquí esperamos a que 'sistema_facturacion'
+# aparezca de verdad antes de intentar importar nada.
+echo "⏳ Verificando que la base de datos 'sistema_facturacion' ya exista..."
+
+DB_LISTA=""
+for intento in $(seq 1 30); do
+    if [ "$MYSQL_ROOT_AUTH" = "sin_password" ]; then
+        DB_LISTA=$(docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -N -B \
+            -e "SHOW DATABASES LIKE 'sistema_facturacion';" 2>/dev/null || echo "")
+    else
+        DB_LISTA=$(docker exec "${NOMBRE_CARPETA}_db" mariadb -u root -proot -N -B \
+            -e "SHOW DATABASES LIKE 'sistema_facturacion';" 2>/dev/null || echo "")
+    fi
+
+    if [ "$DB_LISTA" = "sistema_facturacion" ]; then
+        echo "   ✅ Base de datos 'sistema_facturacion' detectada."
+        break
+    fi
+    echo "   ... la base de datos aún no existe, esperando 1 segundo más ($intento/30)..."
+    sleep 1
+done
+
+if [ "$DB_LISTA" != "sistema_facturacion" ]; then
+    echo "❌ La base de datos 'sistema_facturacion' nunca apareció tras 30 segundos."
+    echo "   Revisa MYSQL_DATABASE en docker-compose.yml y los logs con: docker logs ${NOMBRE_CARPETA}_db"
+    exit 1
+fi
+
+# ==============================================================================
 # 4.1 IMPORTACIÓN DEL ESQUEMA (solo si la base de datos 'comanda' está vacía)
 # ==============================================================================
 echo "================================================="
