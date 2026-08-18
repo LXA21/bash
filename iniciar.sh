@@ -287,13 +287,13 @@ docker compose up -d --force-recreate -V --remove-orphans
 # ==============================================================================
 # 5. ESPERA ACTIVA Y ASIGNACIÓN AUTOMÁTICA DE PERMISOS
 # ==============================================================================
-echo "⏳ 4. Esperando a que el motor de MySQL esté totalmente listo..."
 
-until docker exec "${NOMBRE_CARPETA}_db" mysqladmin ping -u root --silent > /dev/null 2>&1; do
+echo "⏳ Esperando a que el motor de MySQL esté totalmente listo..."
+until docker inspect -f '{{.State.Running}}' "${PREFIX_CONTENEDOR}_db" 2>/dev/null | grep -q "true" && \
+      docker exec "${PREFIX_CONTENEDOR}_db" mysqladmin ping -h 127.0.0.1 -u root --silent > /dev/null 2>&1; do
     echo "   ... MySQL aún se está inicializando, esperando 2 segundos más..."
     sleep 2
 done
-
 echo "⚡ MySQL detectado y listo. Verificando autenticación de root..."
 
 if docker exec "${NOMBRE_CARPETA}_db" mysql -u root -e "SELECT 1;" > /dev/null 2>&1; then
