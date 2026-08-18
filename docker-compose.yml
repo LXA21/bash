@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: ${PREFIX_CONTENEDOR}_app
+    restart: unless-stopped
+    network_mode: host
+
+  db:
+    image: mysql:8.0
+    container_name: ${PREFIX_CONTENEDOR}_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: sistema_facturacion
+    ports:
+      - "127.0.0.1:${PUERTO_DB}:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+      # Monta el archivo database.sql del repositorio para que MySQL lo ejecute automáticamente en el primer arranque
+      - ./database.sql:/docker-entrypoint-initdb.d/database.sql
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: ${PREFIX_CONTENEDOR}_pma
+    restart: unless-stopped
+    environment:
+      PMA_HOST: db
+      PMA_USER: comanda
+      PMA_PASSWORD: "" 
+      ALLOW_NOPASSWORD: "true" 
+    ports:
+      - "${PUERTO_PMA}:80"
+    depends_on:
+      - db
+
+volumes:
+  db_data:
