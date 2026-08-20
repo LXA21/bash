@@ -202,15 +202,44 @@ echo "📥 0.3 Obteniendo repositorio"
 echo "================================================="
 
 extract_repository_zip() {
-    local zip_file="$1" dest="$2" extract_dir top_dir depth
+    local zip_file="$1" dest="$2" extract_dir top_dir depth rc
+
+    # Validación mínima: que el archivo descargado exista y no esté vacío
+    # antes de intentar descomprimir (evita fallos confusos de unzip).
+    if [ ! -s "$zip_file" ]; then
+        echo "❌ El archivo ZIP descargado está vacío o no existe: $zip_file"
+        exit 1
+    fi
+
     extract_dir=$(mktemp -d)
 
     echo "📦 Extrayendo repositorio ZIP..."
-    if ! unzip -q "$zip_file" -d "$extract_dir"; then
+
+    # CORRECCIÓN CRÍTICA: unzip devuelve código 1 para simples ADVERTENCIAS
+    # (bytes extra al inicio del zip, CRC no crítico, etc.), no solo para
+    # errores fatales (código >=2). Como el script es "universal" y debe
+    # aceptar zips generados por cualquier plataforma (GitHub, GitLab,
+    # Bitbucket, paneles de exportación propios, etc.), tratar el código 1
+    # como fallo total descartaba extracciones que en realidad SÍ habían
+    # funcionado. Ahora solo se considera error fatal un código >=2, o que
+    # el directorio de extracción quede vacío.
+    set +e
+    unzip -q -o "$zip_file" -d "$extract_dir"
+    rc=$?
+    set -e
+
+    if [ "$rc" -ge 2 ] || [ -z "$(find "$extract_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
         rm -rf "$extract_dir"
-        echo "❌ No se pudo extraer el ZIP del repositorio."
+        echo "❌ No se pudo extraer el ZIP del repositorio (código de salida de unzip: $rc)."
         exit 1
+    elif [ "$rc" -eq 1 ]; then
+        echo "⚠️ unzip reportó advertencias no fatales (código 1) al extraer; se continúa porque el contenido sí se extrajo."
     fi
+
+    # Eliminar basura típica de zips generados en macOS que rompe la
+    # detección de "carpeta envolvente única" más abajo.
+    find "$extract_dir" -maxdepth 2 -type d -name '__MACOSX' -exec rm -rf {} + 2>/dev/null || true
+    find "$extract_dir" -maxdepth 2 -type f -name '.DS_Store' -delete 2>/dev/null || true
 
     # CORRECCIÓN: navegar recursivamente mientras el nivel actual sea
     # exactamente UNA carpeta envolvente sin archivos sueltos. Esto evita el
@@ -227,19 +256,59 @@ extract_repository_zip() {
         fi
     done
 
+    if [ -z "$(find "$top_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        rm -rf "$extract_dir"
+        echo "❌ El ZIP se extrajo pero no contiene archivos utilizables."
+        exit 1
+    fi
+
     mkdir -p "$dest"
     tar -C "$top_dir" -cf - . | tar -C "$dest" -xf -
     rm -rf "$extract_dir"
+
+    if [ -z "$(find "$dest" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        echo "❌ La copia final del repositorio quedó vacía en '$dest'."
+        exit 1
+    fi
+    echo "✅ ZIP descomprimido correctamente en: $dest"
 }
 
 REPO_URL_NO_QUERY="${REPO_URL%%\?*}"
+
+# CORRECCIÓN: para que el script sea realmente "universal" no basta con mirar
+# si la URL termina en ".zip" — muchos paneles/plataformas sirven ZIPs desde
+# URLs sin esa extensión (p. ej. endpoints de exportación, enlaces firmados de
+# S3, "/download?format=zip", etc.). Además de la extensión, se comprueban las
+# cabeceras HTTP (Content-Type / Content-Disposition) y, como última
+# comprobación, la firma binaria real del archivo ya descargado ("PK").
+IS_ZIP_URL=0
 case "${REPO_URL_NO_QUERY,,}" in
-    *.zip)
+    *.zip) IS_ZIP_URL=1 ;;
+esac
+
+if [ "$IS_ZIP_URL" -eq 0 ]; then
+    HEADERS=$(curl -fsIL --retry 2 --connect-timeout 10 "$REPO_URL" 2>/dev/null || true)
+    if printf '%s' "$HEADERS" | tr -d '\r' | grep -qiE '^(content-type: .*zip|content-disposition: .*\.zip)'; then
+        IS_ZIP_URL=1
+    fi
+fi
+
+case "$IS_ZIP_URL" in
+    1)
         ZIP_TMP=$(mktemp --suffix=.zip)
         echo "⬇️ Descargando ZIP: $REPO_URL"
         if ! curl -fL --retry 3 --connect-timeout 20 "$REPO_URL" -o "$ZIP_TMP"; then
             rm -f "$ZIP_TMP"
             echo "❌ No se pudo descargar el ZIP del repositorio."
+            exit 1
+        fi
+        # Última verificación por firma binaria: un ZIP real empieza con "PK".
+        # Si esto no coincide (p. ej. la URL devolvió una página HTML de error
+        # o de login), se avisa claramente en vez de intentar descomprimir basura.
+        if [ "$(head -c 2 "$ZIP_TMP" 2>/dev/null)" != "PK" ]; then
+            echo "❌ El archivo descargado no es un ZIP válido (no empieza con la firma 'PK')."
+            echo "   Verifica que la URL sea un enlace directo de descarga (no una página HTML)."
+            rm -f "$ZIP_TMP"
             exit 1
         fi
         if [ -e "$REPO_DIR" ]; then
