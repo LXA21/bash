@@ -261,6 +261,10 @@ esac
 
 $SUDO chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$REPO_DIR" 2>/dev/null || true
 
+# Ruta INMUTABLE del repositorio original. Nunca debe confundirse con Pn/source.
+ORIGINAL_REPO_DIR="$REPO_DIR"
+REPO_DIR_ORIGINAL="$ORIGINAL_REPO_DIR"
+
 echo "✅ Código fuente: $REPO_DIR"
 
 # ------------------------------------------------------------------------------
@@ -952,16 +956,80 @@ EOF
     echo "✅ Compose generado para la instancia."
 fi
 
-# Validación preventiva de Dockerfiles generados.
-# No sustituye docker build: evita errores obvios por COPY/ADD inexistentes
-# y detecta referencias de rutas absolutas generadas sin existir en la imagen.
+# ------------------------------------------------------------------------------
+# Validación preventiva de Dockerfiles
+# ------------------------------------------------------------------------------
+# REGLA CRÍTICA:
+#   - Dockerfile que ya existía en el repositorio: NO se modifica y NO se etiqueta
+#     como "generado" aunque contenga chown/chmod específicos.
+#   - Dockerfile generado por este instalador: se valida estrictamente.
+#   - Si un Dockerfile EXISTENTE referencia una ruta de la imagen que no existe ni
+#     se crea previamente, no se intenta "corregirlo" silenciosamente: se detiene
+#     ANTES del build y se muestra la causa exacta.
+validate_generated_dockerfile_copy_sources() {
+    local dockerfile="$1" ctx="$2" line src src_abs
+    [ -f "$dockerfile" ] || { echo "❌ No existe Dockerfile: $dockerfile"; return 1; }
+    while IFS= read -r line; do
+        src=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*(COPY|ADD)[[:space:]]+(--[^[:space:]]+[[:space:]]+)*([^[:space:]]+)([[:space:]]+[^[:space:]]+)?$/\3/')
+        [ -n "$src" ] || continue
+        case "$src" in
+            .|./*) continue ;;
+            http://*|https://*|--from=*) continue ;;
+        esac
+        src_abs="$ctx/$src"
+        if [[ "$src" == *'*'* || "$src" == *'?'* || "$src" == *'['* ]]; then
+            compgen -G "$src_abs" >/dev/null 2>&1 || { echo "❌ Dockerfile generado referencia un patrón inexistente: $src"; return 1; }
+        elif [ ! -e "$src_abs" ]; then
+            echo "❌ Dockerfile generado referencia una ruta inexistente en el contexto: $src"
+            echo "   Contexto: $ctx"
+            return 1
+        fi
+    done < <(grep -E '^[[:space:]]*(COPY|ADD)[[:space:]]+' "$dockerfile" || true)
+    return 0
+}
+
+# Verifica RUN chown/chmod sobre rutas absolutas del DOCUMENTO existente.
+# No modifica el archivo: solo evita llegar al build con un fallo determinista.
+validate_existing_dockerfile_runtime_paths() {
+    local svc ctx df eff rel path candidate source_rel
+    [ -n "${BUILD_TARGETS:-}" ] || return 0
+    while IFS=$'\t' read -r svc ctx df eff; do
+        [ -n "$svc" ] || continue
+        case "$eff" in
+            "$REPO_DIR_ORIGINAL"/*) rel="${eff#$REPO_DIR_ORIGINAL/}" ;;
+            *) continue ;;
+        esac
+        path="$INSTANCE_SOURCE/$rel"
+        [ -f "$path" ] || continue
+
+        # Este chequeo SOLO aplica a Dockerfiles que ya existían en el repositorio.
+        if [ -f "$REPO_DIR_ORIGINAL/$rel" ]; then
+            while IFS= read -r candidate; do
+                [ -n "$candidate" ] || continue
+                candidate="${candidate#/var/www/html/}"
+                case "$candidate" in
+                    storage|storage/*|api/events|api/events/*|bootstrap/cache|bootstrap/cache/*|var|var/*|runtime|runtime/*|writable|writable/*)
+                        source_rel="$candidate"
+                        if [ ! -e "$ctx/$source_rel" ] && ! grep -Eq "(mkdir|install)[[:space:]]+[^\n]*${source_rel}([[:space:]]|/|$)" "$path"; then
+                            echo "❌ Dockerfile existente '$rel' intenta usar '/var/www/html/$source_rel', pero esa ruta no existe en el build.context."
+                            echo "   Servicio : $svc"
+                            echo "   Contexto : $ctx"
+                            echo "   Archivo  : $rel"
+                            echo "   El script NO modificará el Dockerfile del proyecto."
+                            echo "   Corrige el repositorio o crea la ruta antes de volver a desplegar."
+                            return 1
+                        fi
+                        ;;
+                esac
+            done < <(grep -Eo '/var/www/html/(storage|storage/[^[:space:]&;|]+|api/events|api/events/[^[:space:]&;|]+|bootstrap/cache|bootstrap/cache/[^[:space:]&;|]+|var|var/[^[:space:]&;|]+|runtime|runtime/[^[:space:]&;|]+|writable|writable/[^[:space:]&;|]+)' "$path" 2>/dev/null | sort -u || true)
+        fi
+    done <<< "$BUILD_TARGETS"
+    return 0
+}
+
 validate_generated_dockerfiles() {
     local svc ctx df eff rel path
     local any_generated=0
-
-    # Con Compose: un Dockerfile se considera generado por el instalador SOLO si
-    # no existía en el repositorio original. Los Dockerfiles que ya venían en el
-    # proyecto se leen, se validan estructuralmente por Docker Compose y se respetan.
     if [ -n "${BUILD_TARGETS:-}" ]; then
         while IFS=$'\t' read -r svc ctx df eff; do
             [ -n "$svc" ] || continue
@@ -972,14 +1040,17 @@ validate_generated_dockerfiles() {
             path="$INSTANCE_SOURCE/$rel"
             [ -f "$path" ] || { echo "❌ Falta el Dockerfile de '$svc': $rel"; return 1; }
 
+            # La existencia en el repositorio ORIGINAL es la única fuente de verdad
+            # para decidir si el Dockerfile era del proyecto.
             if [ -f "$REPO_DIR_ORIGINAL/$rel" ]; then
-                echo "ℹ️ '$rel' pertenece al proyecto; no se modifica ni se aplica la validación de Dockerfile generado."
+                echo "ℹ️ '$rel' es Dockerfile ORIGINAL del proyecto: se respeta sin modificar y no se aplican reglas del generador."
                 continue
             fi
 
             any_generated=1
             if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$path"; then
-                echo "❌ El generador produjo una instrucción de permisos no dinámica en '$rel'."
+                echo "❌ El generador produjo una instrucción de permisos estática en '$rel'."
+                echo "   Esto no debe ocurrir: los permisos generados deben ser dinámicos."
                 return 1
             fi
             if grep -qE 'php:[^[:space:]]+' "$path" && grep -qE 'chown -R www-data:www-data' "$path"; then
@@ -988,11 +1059,10 @@ validate_generated_dockerfiles() {
             validate_generated_dockerfile_copy_sources "$path" "$ctx" || return 1
         done <<< "$BUILD_TARGETS"
     elif [ -n "${INSTANCE_DOCKERFILE_PATH:-}" ] && [ -f "$INSTANCE_DOCKERFILE_PATH" ]; then
-        # Compose generado: aquí solo validamos si el Dockerfile fue generado por el instalador.
-        if [ -n "${DOCKERFILE_WAS_GENERATED:-}" ] && [ "$DOCKERFILE_WAS_GENERATED" = "1" ]; then
+        if [ "${DOCKERFILE_WAS_GENERATED:-0}" = "1" ]; then
             any_generated=1
             if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$INSTANCE_DOCKERFILE_PATH"; then
-                echo "❌ El generador produjo una instrucción de permisos no dinámica en el Dockerfile."
+                echo "❌ El generador produjo una instrucción de permisos estática en el Dockerfile."
                 return 1
             fi
             if grep -qE 'php:[^[:space:]]+' "$INSTANCE_DOCKERFILE_PATH" && grep -qE 'chown -R www-data:www-data' "$INSTANCE_DOCKERFILE_PATH"; then
@@ -1001,49 +1071,12 @@ validate_generated_dockerfiles() {
             validate_generated_dockerfile_copy_sources "$INSTANCE_DOCKERFILE_PATH" "$REPO_DIR_ORIGINAL" || return 1
         fi
     fi
-
-    if [ "$any_generated" -eq 0 ]; then
-        echo "ℹ️ No hay Dockerfiles generados por el instalador que requieran validación adicional."
-    fi
-    return 0
-}
-
-# Si ya existe Compose, NO se reescribe. Solo se valida y se interpreta.
-COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
-REPO_DIR_ORIGINAL="$REPO_DIR"
-REPO_DIR="$INSTANCE_SOURCE"
-
-validate_existing_dockerfiles() {
-    local path svc ctx df eff rel candidate
-    [ -n "${BUILD_TARGETS:-}" ] || return 0
-    while IFS=$'\t' read -r svc ctx df eff; do
-        [ -n "$svc" ] || continue
-        case "$eff" in
-            "$REPO_DIR_ORIGINAL"/*) rel="${eff#$REPO_DIR_ORIGINAL/}" ;;
-            *) continue ;;
-        esac
-        path="$INSTANCE_SOURCE/$rel"
-        [ -f "$path" ] || continue
-        if grep -qE 'RUN .*chown .*(/var/www/html/(storage|api/events))' "$path"; then
-            # No se modifica el Dockerfile existente. Solo detectamos si una ruta
-            # explícita de permisos no existe en el contexto y tampoco es creada por
-            # una instrucción previa del mismo Dockerfile.
-            for candidate in storage api/events; do
-                if grep -q "/var/www/html/$candidate" "$path" && [ ! -e "$ctx/$candidate" ] && \
-                   ! grep -qE "(mkdir|install)[[:space:]]+(-p[[:space:]]+)?/var/www/html/$candidate" "$path"; then
-                    echo "⚠️ Dockerfile existente '$rel' referencia /var/www/html/$candidate pero esa ruta no existe en el contexto."
-                    echo "   El archivo es propiedad del proyecto y NO será modificado automáticamente."
-                    echo "   Si esa ruta debe existir, corrige el repositorio o crea el directorio antes del build."
-                    return 1
-                fi
-            done
-        fi
-    done <<< "$BUILD_TARGETS"
+    [ "$any_generated" -eq 0 ] && echo "ℹ️ No hay Dockerfiles generados por el instalador que requieran validación adicional."
     return 0
 }
 
 validate_generated_dockerfiles
-validate_existing_dockerfiles
+validate_existing_dockerfile_runtime_paths
 
 if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config >/dev/null; then
     echo "❌ El Compose existente/generado no pudo ser resuelto por Docker Compose."
@@ -1058,14 +1091,6 @@ mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_F
 echo "✅ Compose válido. Servicios detectados:"
 printf '   • %s\n' "${SERVICES[@]}"
 
-# Validar un Dockerfile solo cuando un servicio realmente lo utiliza.
-if grep -qE '^\s*build:' <<<"$COMPOSE_CONFIG"; then
-    echo "🔨 Validando/build del Dockerfile declarado por Compose..."
-    if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" build; then
-        echo "❌ Falló la construcción de una imagen declarada por Compose."
-        exit 1
-    fi
-fi
 
 [ -f "$REPO_DIR/.env.example" ] && cp "$REPO_DIR/.env.example" "$CARPETA_DESTINO/.env.example" || true
 
@@ -1295,6 +1320,39 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
 fi
 
 # ------------------------------------------------------------------------------
+# 4.1 Preflight de credenciales BD antes de tocar Docker
+# ------------------------------------------------------------------------------
+validate_db_credentials_plan() {
+    [ -n "$DB_SERVICE" ] || return 0
+    [ "$DB_MODE" != "3" ] || return 0
+    if [ -z "$DB_ENGINE" ]; then
+        echo "❌ No se pudo determinar el motor de BD de '$DB_SERVICE'."
+        echo "   No se crearán usuarios ni se intentará una conexión a ciegas."
+        return 1
+    fi
+    if [ -z "$DB_NAME" ]; then
+        echo "❌ No se definió el nombre de la base de datos."
+        return 1
+    fi
+    if [ "$CREATE_DB_USER" = "1" ] && [ -z "$DB_APP_USER" ]; then
+        echo "❌ Se solicitó crear usuario BD pero el nombre quedó vacío."
+        return 1
+    fi
+    # Para MySQL/MariaDB, si Docker ya declara MYSQL/MARIADB_USER, una contraseña
+    # diferente solo es válida si el usuario será alterado explícitamente después.
+    # La opción de reutilizar credenciales evita esa desincronización.
+    if [[ "$DB_ENGINE" == "mysql" || "$DB_ENGINE" == "mariadb" ]] && [ -n "$DB_USER_DETECTED" ] && [ "$CREATE_DB_USER" = "1" ]; then
+        if [ "$DB_APP_USER" = "$DB_USER_DETECTED" ] && [ -n "$DB_PASSWORD_DETECTED" ] && [ "$DB_APP_PASS" != "$DB_PASSWORD_DETECTED" ]; then
+            echo "❌ El usuario BD '$DB_APP_USER' ya está declarado por Docker con una contraseña diferente."
+            echo "   Debes reutilizar las credenciales declaradas por Docker o cambiar conscientemente la configuración de la aplicación/Compose."
+            return 1
+        fi
+    fi
+    return 0
+}
+validate_db_credentials_plan
+
+# ------------------------------------------------------------------------------
 # 5. Generar variables de instancia
 # ------------------------------------------------------------------------------
 NUM_INSTANCIA=$((CONTADOR - 1))
@@ -1436,6 +1494,20 @@ for name,c in services.items():
     user=first(merged,user_keys)
     password=first(merged,pass_keys)
 
+    # Soporte universal para DATABASE_URL / DATABASE_URI usados por muchos frameworks.
+    database_url=first(merged,{'DATABASE_URL','DATABASE_URI'})
+    if database_url:
+        try:
+            from urllib.parse import urlparse, unquote
+            u=urlparse(database_url)
+            if not host: host=u.hostname or ''
+            if not port: port=str(u.port or '')
+            if not database: database=(u.path or '').lstrip('/')
+            if not user: user=unquote(u.username or '')
+            if not password: password=unquote(u.password or '')
+        except Exception:
+            warnings.append(f"{name}: DATABASE_URL no pudo analizarse automáticamente; se respetará sin modificarla.")
+
     if not any([host,port,database,user,password]):
         continue
 
@@ -1476,6 +1548,16 @@ PYDB
 }
 
 validate_app_db_configuration
+
+# SOLO después de validar la topología app↔BD y las credenciales declaradas se permite construir.
+# Así un error de DB_HOST/DB_PORT/usuario/red se detecta antes de gastar tiempo en el build.
+if grep -qE '^\s*build:' <<<"$COMPOSE_CONFIG"; then
+    echo "🔨 Validando/build de los Dockerfiles declarados por Compose..."
+    if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" build; then
+        echo "❌ Falló la construcción de una imagen declarada por Compose."
+        exit 1
+    fi
+fi
 
 ANALYSIS_FILE="$CARPETA_DESTINO/resource-analysis.txt"
 printf "%s\n" "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json.tmp"
@@ -1764,6 +1846,86 @@ done
     echo "✅ Base de datos lista."
 
     # --------------------------------------------------------------------------
+    # 11.1 Comprobación REAL de red app -> BD
+    # --------------------------------------------------------------------------
+    # No basta con que el contenedor DB esté healthy: la aplicación puede seguir
+    # teniendo DB_HOST/DB_PORT incorrectos o estar aislada en otra red.
+    validate_live_app_db_network() {
+        local svc cid host port
+        [ -n "$DB_SERVICE" ] || return 0
+        [ "$DB_MODE" != "3" ] || return 0
+        while IFS=$'\t' read -r svc host port; do
+            [ -n "$svc" ] || continue
+            [ "$svc" = "$DB_SERVICE" ] && continue
+            [ "$host" = "$DB_SERVICE" ] || continue
+            cid=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" ps -q "$svc" 2>/dev/null || true)
+            [ -n "$cid" ] || continue
+            echo "🔌 Probando conectividad $svc -> $DB_SERVICE ($host:$port)..."
+
+            # Intentos en orden: nc, bash /dev/tcp, PHP, Python, Node.
+            if docker exec "$cid" sh -c "command -v nc >/dev/null 2>&1 && nc -z -w 5 '$host' '$port'" >/dev/null 2>&1; then
+                echo "   ✅ TCP accesible desde '$svc'."
+                continue
+            fi
+            if docker exec "$cid" sh -c "command -v bash >/dev/null 2>&1 && bash -lc 'echo > /dev/tcp/$host/$port'" >/dev/null 2>&1; then
+                echo "   ✅ TCP accesible desde '$svc'."
+                continue
+            fi
+            if docker exec "$cid" sh -c "command -v php >/dev/null 2>&1 && php -r '\$f=@fsockopen(\"$host\",$port,\$e,\$m,5); exit(\$f?0:1);'" >/dev/null 2>&1; then
+                echo "   ✅ TCP accesible desde '$svc'."
+                continue
+            fi
+            if docker exec "$cid" sh -c "command -v python3 >/dev/null 2>&1 && python3 -c 'import socket; s=socket.create_connection((\"$host\",$port),5); s.close()'" >/dev/null 2>&1; then
+                echo "   ✅ TCP accesible desde '$svc'."
+                continue
+            fi
+            if docker exec "$cid" sh -c "command -v node >/dev/null 2>&1 && node -e 'const net=require(\"net\");let s=net.createConnection($port,\"$host\");s.setTimeout(5000);s.on(\"connect\",()=>{s.destroy();process.exit(0)});s.on(\"error\",()=>process.exit(1));s.on(\"timeout\",()=>process.exit(1))'" >/dev/null 2>&1; then
+                echo "   ✅ TCP accesible desde '$svc'."
+                continue
+            fi
+
+            echo "❌ '$svc' no puede alcanzar '$DB_SERVICE' en $host:$port."
+            echo "   Verifica DB_HOST, DB_PORT y las networks del Compose."
+            return 1
+        done < <(python3 - "$RENDERED_JSON" "$DB_SERVICE" "$INSTANCE_SOURCE/.env" <<'PYLIVE'
+import json,sys,os
+from urllib.parse import urlparse
+j=json.loads(sys.argv[1]); dbsvc=sys.argv[2]; envpath=sys.argv[3]
+services=j.get('services') or {}
+project={}
+if os.path.isfile(envpath):
+    for raw in open(envpath,encoding='utf-8',errors='ignore'):
+        line=raw.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k,v=line.split('=',1); project[k.strip()]=v.strip().strip('"').strip("'")
+
+def envmap(c):
+    e=c.get('environment') or {}
+    if isinstance(e,list): e={x.split('=',1)[0]:x.split('=',1)[1] if '=' in x else '' for x in e}
+    return {str(k): '' if v is None else str(v) for k,v in e.items()}
+def first(e,keys):
+    for k in keys:
+        if e.get(k): return e[k]
+    return ''
+for name,c in services.items():
+    if name==dbsvc: continue
+    e=dict(project); e.update({k:v for k,v in envmap(c).items() if v})
+    host=first(e,('DB_HOST','DATABASE_HOST','MYSQL_HOST','MARIADB_HOST','POSTGRES_HOST'))
+    port=first(e,('DB_PORT','DATABASE_PORT','MYSQL_PORT','MARIADB_PORT','POSTGRES_PORT'))
+    url=first(e,('DATABASE_URL','DATABASE_URI'))
+    if url:
+        try:
+            u=urlparse(url); host=host or (u.hostname or ''); port=port or str(u.port or '')
+        except Exception: pass
+    if host==dbsvc:
+        if not port: port='5432' if 'POSTGRES' in str(services.get(dbsvc,{}).get('environment','')) else '3306'
+        print(f'{name}\t{host}\t{port}')
+PYLIVE
+)
+    }
+    validate_live_app_db_network
+
+    # --------------------------------------------------------------------------
     # 12. Inicialización MySQL/MariaDB sin destruir datos
     # --------------------------------------------------------------------------
     if [[ "$DB_ENGINE" == "mysql" || "$DB_ENGINE" == "mariadb" ]] && [ -n "$DB_NAME" ]; then
@@ -1863,7 +2025,7 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
             fi
             if [ "$GRANT_MODE" != "none" ]; then
                 if [ -n "$DB_APP_PASS" ]; then
-                    if ! docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u "$DB_APP_USER" -p"$DB_APP_PASS" -N -B -e "SELECT 1 FROM \\`$DB_NAME\\`.$(printf '%s' 'information_schema').SCHEMATA LIMIT 1;" >/dev/null 2>&1; then
+                    if ! docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u "$DB_APP_USER" -p"$DB_APP_PASS" -N -B -e "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(sql_escape "$DB_NAME")' LIMIT 1;" >/dev/null 2>&1; then
                         echo "⚠️ No se pudo autenticar al usuario '$DB_APP_USER' con la contraseña configurada."
                         echo "   Verifica que la aplicación use exactamente esas credenciales."
                         exit 1
