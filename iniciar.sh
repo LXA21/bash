@@ -367,6 +367,30 @@ detect_project_type() {
 PROJECT_TYPE=$(detect_project_type)
 echo "🧩 Tecnología detectada: $PROJECT_TYPE"
 
+# Detectar tecnología de un servicio concreto cuando Compose tiene múltiples builds.
+# La prioridad es: archivos del contexto -> nombre del servicio/contexto -> raíz del proyecto.
+detect_service_type() {
+    local svc="$1" ctx="$2" lower
+    lower=$(printf '%s' "$svc $ctx" | tr '[:upper:]' '[:lower:]')
+    if [ -d "$ctx" ]; then
+        if [ -f "$ctx/composer.json" ] || find "$ctx" -maxdepth 2 -type f -name '*.php' -print -quit | grep -q .; then echo php; return; fi
+        if [ -f "$ctx/package.json" ]; then echo node; return; fi
+        if [ -f "$ctx/manage.py" ] || [ -f "$ctx/requirements.txt" ] || [ -f "$ctx/pyproject.toml" ]; then echo python; return; fi
+        if [ -f "$ctx/pom.xml" ] || [ -f "$ctx/build.gradle" ] || [ -f "$ctx/build.gradle.kts" ]; then echo java; return; fi
+        if find "$ctx" -maxdepth 2 -type f -name 'nginx.conf' -print -quit | grep -q .; then echo nginx; return; fi
+        if find "$ctx" -maxdepth 2 -type f \( -name 'httpd.conf' -o -name 'apache2.conf' \) -print -quit | grep -q .; then echo apache; return; fi
+    fi
+    case "$lower" in
+        *nginx*|*openresty*) echo nginx; return ;;
+        *apache*|*httpd*) echo apache; return ;;
+        *php*|*fpm*) echo php; return ;;
+        *node*|*npm*) echo node; return ;;
+        *python*|*django*|*flask*|*fastapi*) echo python; return ;;
+        *java*|*spring*) echo java; return ;;
+    esac
+    echo "$PROJECT_TYPE"
+}
+
 # Detectar un puerto ya declarado por el proyecto antes de inventar uno.
 detect_app_port() {
     local p=""
@@ -384,7 +408,17 @@ APP_PORT_DETECTED=$(detect_app_port)
 # después de copiar la instancia, para que sus rutas sean las definitivas.
 generate_dockerfile_if_missing() {
     [ -n "$DOCKERFILE_PATH" ] && return 0
-    echo "🛠️ No existe Dockerfile. Se generará a partir de la estructura detectada."
+
+    # Si Compose ya existe, NO generamos un Dockerfile genérico en la raíz.
+    # Los Dockerfiles requeridos por cada servicio se resuelven después, respetando
+    # exactamente build.context + build.dockerfile. Si Compose solo usa imágenes,
+    # tampoco hace falta inventar un Dockerfile.
+    if [ -n "$COMPOSE_FILE" ]; then
+        echo "ℹ️ Compose existente: la generación de Dockerfiles se hará por servicio solo si algún build los requiere."
+        return 0
+    fi
+
+    echo "🛠️ No existe Dockerfile ni Compose. Se generará un Dockerfile a partir de la estructura detectada."
     case "$PROJECT_TYPE" in
         node)
             cat > "$REPO_DIR/Dockerfile.generated" <<'EOF'
@@ -489,6 +523,23 @@ printf '\nCOMPOSE_PROJECT_NAME=%s\nPREFIX_CONTENEDOR=%s\nPROJECT_NAME=%s\nPROJEC
 mkdir -p "$INSTANCE_SOURCE"
 tar -C "$REPO_DIR" --exclude='./.git' -cf - . | tar -C "$INSTANCE_SOURCE" -xf -
 
+# Mantener exactamente el Compose que venía en el repositorio, pero apuntando
+# a la copia de la instancia. Nunca sustituirlo por compose.generated.yml.
+INSTANCE_COMPOSE_FILE=""
+if [ -n "$COMPOSE_FILE" ]; then
+    compose_rel="${COMPOSE_FILE#$REPO_DIR/}"
+    if [ "$compose_rel" = "$COMPOSE_FILE" ]; then
+        echo "❌ El Compose detectado no pertenece al repositorio: $COMPOSE_FILE"
+        exit 1
+    fi
+    if [ -f "$INSTANCE_SOURCE/$compose_rel" ]; then
+        INSTANCE_COMPOSE_FILE="$INSTANCE_SOURCE/$compose_rel"
+    else
+        echo "❌ El Compose detectado no apareció en la copia de la instancia: $compose_rel"
+        exit 1
+    fi
+fi
+
 extract_embedded_zips() {
     local pass zip_file key out_dir found
     declare -A ZIP_DONE=()
@@ -535,11 +586,14 @@ if [ -n "$BUILD_TARGETS" ]; then
                 rel="${eff#$REPO_DIR/}"
                 if [ -f "$INSTANCE_SOURCE/$rel" ]; then
                     echo "✅ $svc → Dockerfile existente: $rel"
+                    [ -n "$INSTANCE_DOCKERFILE_PATH" ] || INSTANCE_DOCKERFILE_PATH="$INSTANCE_SOURCE/$rel"
                 else
                     echo "⚠️ $svc requiere Dockerfile: $rel"
                     target="$INSTANCE_SOURCE/$rel"
                     mkdir -p "$(dirname "$target")"
-                    case "$PROJECT_TYPE" in
+                    service_type=$(detect_service_type "$svc" "$ctx")
+                    echo "   🧩 Tecnología para '$svc': $service_type"
+                    case "$service_type" in
                         node) cat > "$target" <<'EOF'
 FROM node:20-alpine
 WORKDIR /app
@@ -552,7 +606,7 @@ CMD ["npm", "start"]
 EOF
                             ;;
                         php)
-                            if grep -Eqi 'nginx|openresty' "$COMPOSE_FILE" 2>/dev/null; then
+                            if grep -Eqi 'nginx|openresty' "$COMPOSE_FILE" 2>/dev/null || [[ "$svc" =~ nginx|fpm ]]; then
                                 cat > "$target" <<'EOF'
 FROM php:8.2-fpm
 WORKDIR /var/www/html
@@ -588,9 +642,55 @@ COPY . /usr/share/nginx/html
 EXPOSE 80
 EOF
                             ;;
+                        nginx)
+                            if [ -f "$ctx/nginx.conf" ]; then
+                                cat > "$target" <<'EOF'
+FROM nginx:alpine
+COPY nginx.conf /etc/nginx/nginx.conf
+EXPOSE 80
+EOF
+                            else
+                                cat > "$target" <<'EOF'
+FROM nginx:alpine
+COPY . /etc/nginx/conf.d/
+EXPOSE 80
+EOF
+                            fi
+                            ;;
+                        apache)
+                            if [ -f "$ctx/httpd.conf" ]; then
+                                cat > "$target" <<'EOF'
+FROM httpd:2.4
+COPY httpd.conf /usr/local/apache2/conf/httpd.conf
+EXPOSE 80
+EOF
+                            elif [ -f "$ctx/apache2.conf" ]; then
+                                cat > "$target" <<'EOF'
+FROM httpd:2.4
+COPY apache2.conf /usr/local/apache2/conf/httpd.conf
+EXPOSE 80
+EOF
+                            else
+                                cat > "$target" <<'EOF'
+FROM httpd:2.4
+COPY . /usr/local/apache2/conf/
+EXPOSE 80
+EOF
+                            fi
+                            ;;
+                        java)
+                            cat > "$target" <<'EOF'
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY . /app/
+EXPOSE 8080
+CMD ["sh", "-c", "if [ -f app.jar ]; then exec java -jar app.jar; elif [ -f target/*.jar ]; then exec java -jar target/*.jar; else echo 'No se encontró un JAR ejecutable'; exit 1; fi"]
+EOF
+                            ;;
                         *) echo "❌ No se puede generar de forma segura el Dockerfile de '$svc'."; exit 1;;
                     esac
                     echo "✅ Dockerfile generado en la ruta exacta: $rel"
+                    [ -n "$INSTANCE_DOCKERFILE_PATH" ] || INSTANCE_DOCKERFILE_PATH="$target"
                 fi
                 ;;
             *)
@@ -628,6 +728,7 @@ detect_web_stack() {
 WEB_STACK=$(detect_web_stack)
 echo "🌐 Arquitectura web detectada: $WEB_STACK"
 
+INSTANCE_COMPOSE_FILE="${INSTANCE_COMPOSE_FILE:-}"
 if [ -z "$INSTANCE_COMPOSE_FILE" ]; then
     # Generar Compose en la copia usando el Dockerfile que se va a desplegar.
     container_port=80
@@ -888,7 +989,7 @@ PUERTO_PMA=$(next_free_port "$BASE_PMA" 2)
 PUERTO_DB=$(next_free_port "$BASE_DB" 1)
 PUERTO_SSL=$(next_free_port "$BASE_SSL" 2)
 
-python3 - "$INSTANCE_ENV" "$COMPOSE_PROJECT_NAME" "$SYSTEM_NAME" "$INSTANCE_SOURCE" "$PUERTO_WEB" "$PUERTO_PMA" "$PUERTO_DB" "$PUERTO_SSL" "$DB_NAME" "$DB_APP_USER" "$DB_APP_PASS" <<'PY'
+python3 - "$INSTANCE_ENV" "$COMPOSE_PROJECT_NAME" "$SYSTEM_NAME" "$INSTANCE_SOURCE" "$PUERTO_WEB" "$PUERTO_PMA" "$PUERTO_DB" "$PUERTO_SSL" "$DB_NAME" "$DB_APP_USER" "$DB_APP_PASS" "$CREATE_DB_USER" <<'PY'
 import sys, os
 p=sys.argv[1]
 managed={
@@ -900,10 +1001,15 @@ managed={
     "PUERTO_PMA": sys.argv[6],
     "PUERTO_DB": sys.argv[7],
     "PUERTO_SSL": sys.argv[8],
-    "DB_DATABASE": sys.argv[9],
-    "DB_USERNAME": sys.argv[10],
-    "DB_PASSWORD": sys.argv[11],
 }
+# No sobrescribir credenciales existentes del proyecto con cadenas vacías.
+# Solo gestionamos las variables genéricas de BD cuando el usuario pidió crear
+# explícitamente un usuario de aplicación.
+if sys.argv[9]:
+    managed["DB_DATABASE"] = sys.argv[9]
+if sys.argv[10] and sys.argv[12] == "1":
+    managed["DB_USERNAME"] = sys.argv[10]
+    managed["DB_PASSWORD"] = sys.argv[11]
 lines=open(p).read().splitlines() if __import__('os').path.exists(p) else []
 out=[]
 seen=set()
