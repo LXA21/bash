@@ -500,6 +500,8 @@ EXPOSE 3000
 CMD ["npm", "start"]
 EOF
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
+            DOCKERFILE_WAS_GENERATED="1"
+            GENERATED_DOCKERFILES="${GENERATED_DOCKERFILES}${DOCKERFILE_PATH}"$'\n'
             ;;
         php)
             # PHP generado de forma conservadora: nunca se asumen rutas de
@@ -563,6 +565,8 @@ EOF
             append_php_runtime_permissions "$REPO_DIR" "$REPO_DIR/Dockerfile.generated"
             GENERATED_PHP_WEB_MODE="$php_web_mode"
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
+            DOCKERFILE_WAS_GENERATED="1"
+            GENERATED_DOCKERFILES="${GENERATED_DOCKERFILES}${DOCKERFILE_PATH}"$'\n'
             ;;
         python)
             if [ ! -f "$REPO_DIR/app.py" ] && [ ! -f "$REPO_DIR/manage.py" ] && [ ! -f "$REPO_DIR/main.py" ]; then
@@ -585,6 +589,8 @@ EXPOSE 8000
 CMD ["sh", "-c", "$python_cmd"]
 EOF
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
+            DOCKERFILE_WAS_GENERATED="1"
+            GENERATED_DOCKERFILES="${GENERATED_DOCKERFILES}${DOCKERFILE_PATH}"$'\n'
             ;;
         static)
             cat > "$REPO_DIR/Dockerfile.generated" <<'EOF'
@@ -593,6 +599,8 @@ COPY . /usr/share/nginx/html
 EXPOSE 80
 EOF
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
+            DOCKERFILE_WAS_GENERATED="1"
+            GENERATED_DOCKERFILES="${GENERATED_DOCKERFILES}${DOCKERFILE_PATH}"$'\n'
             ;;
         *)
             echo "❌ No se pudo determinar de forma segura cómo construir el proyecto."
@@ -604,6 +612,7 @@ EOF
 }
 
 GENERATED_PHP_WEB_MODE=""
+DOCKERFILE_WAS_GENERATED="0"
 generate_dockerfile_if_missing
 
 # Genera solamente los archivos Docker que realmente faltan. Los existentes se respetan.
@@ -697,6 +706,7 @@ echo "================================================="
 # La copia de la instancia debe contener exactamente la configuración que se va a desplegar.
 # Si el proyecto ya tiene Dockerfile/Compose, se leen y se conservan.
 INSTANCE_DOCKERFILE_PATH=""
+GENERATED_DOCKERFILES=""
 # Respetar exactamente cada build.context + build.dockerfile del Compose.
 if [ -n "$BUILD_TARGETS" ]; then
     while IFS=$'\t' read -r svc ctx df eff; do
@@ -870,6 +880,7 @@ EOF
                             ;;
                         *) echo "❌ No se puede generar de forma segura el Dockerfile de '$svc'."; exit 1;;
                     esac
+                    GENERATED_DOCKERFILES="${GENERATED_DOCKERFILES}${target}"$'\n'
                     echo "✅ Dockerfile generado en la ruta exacta: $rel"
                     [ -n "$INSTANCE_DOCKERFILE_PATH" ] || INSTANCE_DOCKERFILE_PATH="$target"
                 fi
@@ -945,7 +956,12 @@ fi
 # No sustituye docker build: evita errores obvios por COPY/ADD inexistentes
 # y detecta referencias de rutas absolutas generadas sin existir en la imagen.
 validate_generated_dockerfiles() {
-    local svc ctx df eff rel
+    local svc ctx df eff rel path
+    local any_generated=0
+
+    # Con Compose: un Dockerfile se considera generado por el instalador SOLO si
+    # no existía en el repositorio original. Los Dockerfiles que ya venían en el
+    # proyecto se leen, se validan estructuralmente por Docker Compose y se respetan.
     if [ -n "${BUILD_TARGETS:-}" ]; then
         while IFS=$'\t' read -r svc ctx df eff; do
             [ -n "$svc" ] || continue
@@ -953,28 +969,41 @@ validate_generated_dockerfiles() {
                 "$REPO_DIR_ORIGINAL"/*) rel="${eff#$REPO_DIR_ORIGINAL/}" ;;
                 *) continue ;;
             esac
-            [ -f "$INSTANCE_SOURCE/$rel" ] || { echo "❌ Falta el Dockerfile de '$svc': $rel"; return 1; }
-            if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$INSTANCE_SOURCE/$rel"; then
-                echo "❌ Se detectó la instrucción antigua insegura en '$rel'."
+            path="$INSTANCE_SOURCE/$rel"
+            [ -f "$path" ] || { echo "❌ Falta el Dockerfile de '$svc': $rel"; return 1; }
+
+            if [ -f "$REPO_DIR_ORIGINAL/$rel" ]; then
+                echo "ℹ️ '$rel' pertenece al proyecto; no se modifica ni se aplica la validación de Dockerfile generado."
+                continue
+            fi
+
+            any_generated=1
+            if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$path"; then
+                echo "❌ El generador produjo una instrucción de permisos no dinámica en '$rel'."
                 return 1
             fi
-            if grep -qE 'php:(8\.[0-9]+|[0-9]+\.)' "$INSTANCE_SOURCE/$rel" && grep -qE 'chown -R www-data:www-data' "$INSTANCE_SOURCE/$rel"; then
-                grep -q '\[ -d "\$d" \]' "$INSTANCE_SOURCE/$rel" || { echo "❌ Permisos PHP no protegidos contra directorios inexistentes: $rel"; return 1; }
+            if grep -qE 'php:[^[:space:]]+' "$path" && grep -qE 'chown -R www-data:www-data' "$path"; then
+                grep -q '\[ -d "\$d" \]' "$path" || { echo "❌ Permisos PHP no protegidos contra directorios inexistentes: $rel"; return 1; }
             fi
-            if ! validate_generated_dockerfile_copy_sources "$INSTANCE_SOURCE/$rel" "$ctx"; then return 1; fi
+            validate_generated_dockerfile_copy_sources "$path" "$ctx" || return 1
         done <<< "$BUILD_TARGETS"
     elif [ -n "${INSTANCE_DOCKERFILE_PATH:-}" ] && [ -f "$INSTANCE_DOCKERFILE_PATH" ]; then
-        # Compose generado: el contexto es la raíz de la instancia.
-        if [[ "$INSTANCE_DOCKERFILE_PATH" == "$INSTANCE_SOURCE/"* ]]; then
+        # Compose generado: aquí solo validamos si el Dockerfile fue generado por el instalador.
+        if [ -n "${DOCKERFILE_WAS_GENERATED:-}" ] && [ "$DOCKERFILE_WAS_GENERATED" = "1" ]; then
+            any_generated=1
             if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$INSTANCE_DOCKERFILE_PATH"; then
-                echo "❌ Se detectó la instrucción antigua insegura en el Dockerfile generado."
+                echo "❌ El generador produjo una instrucción de permisos no dinámica en el Dockerfile."
                 return 1
             fi
-            if grep -qE 'php:(8\.[0-9]+|[0-9]+\.)' "$INSTANCE_DOCKERFILE_PATH" && grep -qE 'chown -R www-data:www-data' "$INSTANCE_DOCKERFILE_PATH"; then
-                grep -q '\[ -d "\$d" \]' "$INSTANCE_DOCKERFILE_PATH" || { echo "❌ Permisos PHP no protegidos en Dockerfile generado."; return 1; }
+            if grep -qE 'php:[^[:space:]]+' "$INSTANCE_DOCKERFILE_PATH" && grep -qE 'chown -R www-data:www-data' "$INSTANCE_DOCKERFILE_PATH"; then
+                grep -q '\[ -d "\$d" \]' "$INSTANCE_DOCKERFILE_PATH" || { echo "❌ Permisos PHP no protegidos contra directorios inexistentes."; return 1; }
             fi
-            validate_generated_dockerfile_copy_sources "$INSTANCE_DOCKERFILE_PATH" "$INSTANCE_SOURCE" || return 1
+            validate_generated_dockerfile_copy_sources "$INSTANCE_DOCKERFILE_PATH" "$REPO_DIR_ORIGINAL" || return 1
         fi
+    fi
+
+    if [ "$any_generated" -eq 0 ]; then
+        echo "ℹ️ No hay Dockerfiles generados por el instalador que requieran validación adicional."
     fi
     return 0
 }
@@ -984,7 +1013,37 @@ COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
 REPO_DIR_ORIGINAL="$REPO_DIR"
 REPO_DIR="$INSTANCE_SOURCE"
 
+validate_existing_dockerfiles() {
+    local path svc ctx df eff rel candidate
+    [ -n "${BUILD_TARGETS:-}" ] || return 0
+    while IFS=$'\t' read -r svc ctx df eff; do
+        [ -n "$svc" ] || continue
+        case "$eff" in
+            "$REPO_DIR_ORIGINAL"/*) rel="${eff#$REPO_DIR_ORIGINAL/}" ;;
+            *) continue ;;
+        esac
+        path="$INSTANCE_SOURCE/$rel"
+        [ -f "$path" ] || continue
+        if grep -qE 'RUN .*chown .*(/var/www/html/(storage|api/events))' "$path"; then
+            # No se modifica el Dockerfile existente. Solo detectamos si una ruta
+            # explícita de permisos no existe en el contexto y tampoco es creada por
+            # una instrucción previa del mismo Dockerfile.
+            for candidate in storage api/events; do
+                if grep -q "/var/www/html/$candidate" "$path" && [ ! -e "$ctx/$candidate" ] && \
+                   ! grep -qE "(mkdir|install)[[:space:]]+(-p[[:space:]]+)?/var/www/html/$candidate" "$path"; then
+                    echo "⚠️ Dockerfile existente '$rel' referencia /var/www/html/$candidate pero esa ruta no existe en el contexto."
+                    echo "   El archivo es propiedad del proyecto y NO será modificado automáticamente."
+                    echo "   Si esa ruta debe existir, corrige el repositorio o crea el directorio antes del build."
+                    return 1
+                fi
+            done
+        fi
+    done <<< "$BUILD_TARGETS"
+    return 0
+}
+
 validate_generated_dockerfiles
+validate_existing_dockerfiles
 
 if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config >/dev/null; then
     echo "❌ El Compose existente/generado no pudo ser resuelto por Docker Compose."
@@ -1021,6 +1080,8 @@ DB_IMAGE=""
 DB_NAME_DETECTED=""
 DB_USER_DETECTED=""
 DB_PASSWORD_DETECTED=""
+DB_ADMIN_USER_DETECTED=""
+DB_ADMIN_PASSWORD_DETECTED=""
 ROOT_PASSWORD_DETECTED=""
 
 for preferred in mysql mariadb db database postgres postgresql; do
@@ -1059,6 +1120,8 @@ if [ -n "$DB_SERVICE" ]; then
     DB_USER_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_USER|MARIADB_USER|POSTGRES_USER):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     DB_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_PASSWORD|MARIADB_PASSWORD|POSTGRES_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     ROOT_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_ROOT_PASSWORD|MARIADB_ROOT_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
+    DB_ADMIN_USER_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+POSTGRES_USER:' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
+    DB_ADMIN_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+POSTGRES_PASSWORD:' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
 
     case "${DB_IMAGE,,}" in
         *mariadb*) DB_ENGINE="mariadb" ;;
@@ -1085,6 +1148,13 @@ if [ -n "$DB_SERVICE" ]; then
             esac
         fi
     fi
+    if [ "$DB_ENGINE" = "postgres" ]; then
+        # POSTGRES_USER/POSTGRES_PASSWORD son credenciales administrativas de la imagen oficial,
+        # no deben tratarse automáticamente como usuario/contraseña de la aplicación.
+        DB_USER_DETECTED=""
+        DB_PASSWORD_DETECTED=""
+        ROOT_PASSWORD_DETECTED="$DB_ADMIN_PASSWORD_DETECTED"
+    fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -1099,6 +1169,17 @@ CREATE_DB_USER="2"
 SQL_FILE=""
 
 if [ -n "$DB_SERVICE" ]; then
+    # Para PostgreSQL, buscar las credenciales de aplicación en los servicios que consumen la BD.
+    # Nunca se reutiliza POSTGRES_USER como usuario de aplicación por defecto.
+    if [ "$DB_ENGINE" = "postgres" ]; then
+        for svc in "${SERVICES[@]}"; do
+            [ "$svc" = "$DB_SERVICE" ] && continue
+            APP_BLOCK=$(service_block "$svc" || true)
+            candidate_user=$(printf '%s\n' "$APP_BLOCK" | grep -E '^[[:space:]]+(DB_USERNAME|DB_USER|DATABASE_USER):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
+            candidate_pass=$(printf '%s\n' "$APP_BLOCK" | grep -E '^[[:space:]]+(DB_PASSWORD|DATABASE_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
+            if [ -n "$candidate_user" ]; then DB_USER_DETECTED="$candidate_user"; DB_PASSWORD_DETECTED="$candidate_pass"; break; fi
+        done
+    fi
     echo "================================================="
     echo "🗄️ 2. Configuración de base de datos"
     echo "================================================="
@@ -1172,27 +1253,43 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
 
     if [ "$CREATE_DB_USER" = "1" ]; then
         DB_APP_USER="$DB_USER_DETECTED"
-        read -r -p "👉 Usuario BD [${DB_APP_USER:-app}]: " tmp
-        DB_APP_USER=${tmp:-${DB_APP_USER:-app}}
-        read -r -s -p "👉 Contraseña BD (ENTER = sin contraseña): " DB_APP_PASS
-        echo ""
-        if [ -n "$DB_APP_PASS" ]; then
-            read -r -s -p "👉 Confirmar contraseña BD: " DB_APP_PASS_CONFIRM
-            echo ""
-            [ "$DB_APP_PASS" = "$DB_APP_PASS_CONFIRM" ] || { echo "❌ Las contraseñas de BD no coinciden."; exit 1; }
+        if [ -n "$DB_USER_DETECTED" ]; then
+            echo "🔎 Docker Compose ya declara el usuario BD '$DB_USER_DETECTED'."
+            if [ -n "$DB_PASSWORD_DETECTED" ]; then echo "   También se detectó una contraseña configurada en Docker (no se mostrará)."; fi
+            echo "1) Usar exactamente las credenciales declaradas por Docker"
+            echo "2) Crear/configurar otro usuario"
+            read -r -p "👉 Selección [1]: " USE_DETECTED_DB_CREDS
+            USE_DETECTED_DB_CREDS=${USE_DETECTED_DB_CREDS:-1}
         else
-            DB_APP_PASS=""
-            echo "✅ El usuario de BD se configurará sin contraseña."
+            USE_DETECTED_DB_CREDS=2
         fi
 
-        if [[ "$DB_ENGINE" == "mysql" || "$DB_ENGINE" == "mariadb" ]]; then
+        if [ "$USE_DETECTED_DB_CREDS" = "1" ]; then
+            DB_APP_USER="$DB_USER_DETECTED"
+            DB_APP_PASS="$DB_PASSWORD_DETECTED"
+            echo "✅ Se reutilizarán las credenciales de Docker para evitar desincronizar la aplicación y la BD."
+        else
+            read -r -p "👉 Usuario BD [${DB_APP_USER:-app}]: " tmp
+            DB_APP_USER=${tmp:-${DB_APP_USER:-app}}
+            read -r -s -p "👉 Contraseña BD (ENTER = sin contraseña): " DB_APP_PASS
+            echo ""
+            if [ -n "$DB_APP_PASS" ]; then
+                read -r -s -p "👉 Confirmar contraseña BD: " DB_APP_PASS_CONFIRM
+                echo ""
+                [ "$DB_APP_PASS" = "$DB_APP_PASS_CONFIRM" ] || { echo "❌ Las contraseñas de BD no coinciden."; exit 1; }
+            else
+                DB_APP_PASS=""
+                echo "✅ El usuario de BD se configurará sin contraseña."
+            fi
+        fi
+
+        if [[ "$DB_ENGINE" == "mysql" || "$DB_ENGINE" == "mariadb" || "$DB_ENGINE" == "postgres" ]]; then
             echo "1) Todos los permisos solo sobre '$DB_NAME'"
             echo "2) Permisos básicos de aplicación"
             echo "3) Crear usuario sin otorgar permisos"
             read -r -p "👉 Permisos [1]: " GRANT_MODE
             GRANT_MODE=${GRANT_MODE:-1}
-        else
-            GRANT_MODE="none"
+            [[ "$GRANT_MODE" =~ ^[123]$ ]] || { echo "❌ Selección inválida."; exit 1; }
         fi
     fi
 fi
@@ -1272,6 +1369,113 @@ render_compose() {
 
 RENDERED_JSON=$(render_compose)
 printf '%s\n' "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json"
+
+# Detectar si los servicios de aplicación tienen una configuración de conexión a BD
+# que contradiga el servicio DB. No se modifica el Compose: se informa y se detiene
+# únicamente cuando la contradicción es inequívoca.
+validate_app_db_configuration() {
+    [ -n "$DB_SERVICE" ] || return 0
+    python3 - "$RENDERED_JSON" "$DB_SERVICE" "$DB_NAME" "$DB_APP_USER" "$DB_APP_PASS" "$INSTANCE_SOURCE/.env" <<'PYDB'
+import json,sys,re,os
+j=json.loads(sys.argv[1]); dbsvc=sys.argv[2]; dbname=sys.argv[3]; dbuser=sys.argv[4]; dbpass=sys.argv[5]
+project_env=sys.argv[6]
+services=j.get('services') or {}
+errors=[]; warnings=[]
+
+def env_map(c):
+    env=c.get('environment') or {}
+    if isinstance(env,list):
+        env={x.split('=',1)[0]:x.split('=',1)[1] if '=' in x else '' for x in env}
+    return {str(k): '' if v is None else str(v) for k,v in env.items()}
+
+def project_env_map(path):
+    out={}
+    if not os.path.isfile(path): return out
+    for raw in open(path,encoding='utf-8',errors='ignore'):
+        line=raw.strip()
+        if not line or line.startswith('#') or '=' not in line: continue
+        k,v=line.split('=',1); out[k.strip()]=v.strip().strip('"').strip("'")
+    return out
+
+def first(env, keys):
+    for k in keys:
+        if k in env and env[k] != '': return env[k]
+    return ''
+
+db=services.get(dbsvc) or {}
+dbenv=env_map(db)
+db_port=''
+for p in db.get('ports') or []:
+    if isinstance(p,dict) and str(p.get('target','')) in {'3306','5432'}:
+        db_port=str(p.get('target'))
+        break
+# container's native port is preferable to the published host port
+if not db_port:
+    db_port='5432' if 'POSTGRES' in ' '.join(dbenv.keys()) else '3306'
+
+db_networks=set((db.get('networks') or {}).keys())
+if not db_networks:
+    db_networks={'default'}
+
+host_keys={'DB_HOST','DATABASE_HOST','MYSQL_HOST','MARIADB_HOST','POSTGRES_HOST'}
+port_keys={'DB_PORT','DATABASE_PORT','MYSQL_PORT','MARIADB_PORT','POSTGRES_PORT'}
+name_keys={'DB_DATABASE','DATABASE_NAME','MYSQL_DATABASE','MARIADB_DATABASE','POSTGRES_DB'}
+user_keys={'DB_USERNAME','DB_USER','DATABASE_USER','MYSQL_USER','MARIADB_USER','POSTGRES_USER'}
+pass_keys={'DB_PASSWORD','DATABASE_PASSWORD','MYSQL_PASSWORD','MARIADB_PASSWORD','POSTGRES_PASSWORD'}
+project_env=project_env_map(project_env)
+
+for name,c in services.items():
+    if name==dbsvc: continue
+    env=env_map(c)
+    # Also inspect the project's .env because frameworks such as Laravel often read it inside the app.
+    merged=dict(project_env)
+    merged.update({k:v for k,v in env.items() if v!=''})
+    host=first(merged,host_keys)
+    port=first(merged,port_keys)
+    database=first(merged,name_keys)
+    user=first(merged,user_keys)
+    password=first(merged,pass_keys)
+
+    if not any([host,port,database,user,password]):
+        continue
+
+    if host in {'localhost','127.0.0.1','::1'} and len(services)>1:
+        errors.append(f"{name}: DB_HOST='{host}' apunta al propio contenedor; debe usar el nombre del servicio Docker '{dbsvc}'.")
+    elif host and host != dbsvc and host not in {str(db.get('container_name','')), dbsvc}:
+        warnings.append(f"{name}: DB_HOST='{host}'. No se modificará porque podría ser un host externo válido.")
+
+    if database and dbname and database != dbname:
+        errors.append(f"{name}: base configurada='{database}' pero la BD gestionada='{dbname}'.")
+    if user and dbuser and user != dbuser:
+        errors.append(f"{name}: usuario configurado='{user}' pero usuario gestionado='{dbuser}'.")
+    if password and dbpass and password != dbpass:
+        errors.append(f"{name}: la contraseña configurada para la BD no coincide con la del usuario gestionado.")
+
+    if port and host == dbsvc and port.isdigit() and port != db_port:
+        errors.append(f"{name}: DB_PORT={port} usa el puerto publicado/incorrecto; el servicio '{dbsvc}' escucha internamente en {db_port}.")
+
+    app_networks=set((c.get('networks') or {}).keys()) or {'default'}
+    if not (app_networks & db_networks):
+        errors.append(f"{name}: no comparte ninguna red Docker con '{dbsvc}'.")
+
+if warnings:
+    print('⚠️ Advertencias de conexión BD:')
+    for x in warnings: print('   '+x)
+if errors:
+    print('❌ Inconsistencias de conexión BD detectadas antes del despliegue:')
+    for x in errors: print('   '+x)
+    print('   No se modificará automáticamente el Compose ni el .env del proyecto.')
+    sys.exit(2)
+PYDB
+    local rc=$?
+    if [ "$rc" -eq 2 ]; then
+        echo "🛑 Se detiene antes de docker compose up para evitar un fallo de conexión a la BD." 
+        return 1
+    fi
+    return "$rc"
+}
+
+validate_app_db_configuration
 
 ANALYSIS_FILE="$CARPETA_DESTINO/resource-analysis.txt"
 printf "%s\n" "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json.tmp"
@@ -1577,6 +1781,26 @@ done
             fi
         }
 
+        # Verificación de compatibilidad de credenciales antes de crear el usuario.
+        # Si Compose ya define MYSQL/MARIADB_USER+PASSWORD y el usuario eligió credenciales
+        # diferentes, la aplicación podría intentar entrar con otras credenciales y fallar.
+        if [ -n "$DB_USER_DETECTED" ] && [ "$CREATE_DB_USER" = "1" ]; then
+            if [ "$DB_APP_USER" != "$DB_USER_DETECTED" ]; then
+                echo "⚠️ El usuario BD elegido ('$DB_APP_USER') no coincide con el usuario declarado por Docker ('$DB_USER_DETECTED')."
+                echo "   No se modificará el Compose existente automáticamente."
+                echo "   La aplicación solo funcionará si su configuración apunta al usuario elegido."
+            elif [ -n "$DB_PASSWORD_DETECTED" ] && [ "$DB_APP_PASS" != "$DB_PASSWORD_DETECTED" ]; then
+                echo "❌ La contraseña elegida para '$DB_APP_USER' no coincide con la contraseña declarada por Docker."
+                echo "   Para evitar un fallo posterior de conexión, selecciona 'usar las credenciales declaradas por Docker' o actualiza la configuración de la aplicación de forma consciente."
+                exit 1
+            elif [ -z "$DB_PASSWORD_DETECTED" ] && [ -n "$DB_APP_PASS" ]; then
+                echo "⚠️ Docker declara el usuario '$DB_APP_USER' sin contraseña, pero se eligió una contraseña."
+                echo "   No se modificará el Compose existente automáticamente."
+                echo "   El despliegue se detendrá para evitar una aplicación desincronizada."
+                exit 1
+            fi
+        fi
+
         DB_EXISTS=$(root_exec -N -B -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(sql_escape "$DB_NAME")';" 2>/dev/null || true)
         if [ "$DB_EXISTS" != "$DB_NAME" ]; then
             root_exec -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\`;"
@@ -1629,6 +1853,73 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
                 2) root_exec -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON \`$DB_NAME\`.* TO '$USER_ESC'@'%'; FLUSH PRIVILEGES;" ;;
             esac
             echo "✅ Usuario de aplicación configurado."
+
+            # Comprobación real de autenticación con las credenciales creadas/reutilizadas.
+            # Esto detecta antes del cierre del instalador un usuario inexistente, contraseña
+            # desincronizada o permisos insuficientes.
+            if ! root_exec -N -B -e "SELECT 1;" >/dev/null 2>&1; then
+                echo "❌ La conexión administrativa a la BD dejó de estar disponible."
+                exit 1
+            fi
+            if [ "$GRANT_MODE" != "none" ]; then
+                if [ -n "$DB_APP_PASS" ]; then
+                    if ! docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u "$DB_APP_USER" -p"$DB_APP_PASS" -N -B -e "SELECT 1 FROM \\`$DB_NAME\\`.$(printf '%s' 'information_schema').SCHEMATA LIMIT 1;" >/dev/null 2>&1; then
+                        echo "⚠️ No se pudo autenticar al usuario '$DB_APP_USER' con la contraseña configurada."
+                        echo "   Verifica que la aplicación use exactamente esas credenciales."
+                        exit 1
+                    fi
+                else
+                    if ! docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u "$DB_APP_USER" -N -B -e "SELECT 1;" >/dev/null 2>&1; then
+                        echo "⚠️ El usuario '$DB_APP_USER' no pudo autenticarse sin contraseña."
+                        exit 1
+                    fi
+                fi
+            fi
+        fi
+    elif [ "$DB_ENGINE" = "postgres" ] && [ -n "$DB_NAME" ]; then
+        PG_BIN="psql"
+        pg_admin_exec() {
+            if [ -n "$DB_ADMIN_PASSWORD_DETECTED" ]; then
+                docker exec -e PGPASSWORD="$DB_ADMIN_PASSWORD_DETECTED" "$DB_CONTAINER" "$PG_BIN" -U "${DB_ADMIN_USER_DETECTED:-postgres}" "$@"
+            else
+                docker exec "$DB_CONTAINER" "$PG_BIN" -U "${DB_ADMIN_USER_DETECTED:-postgres}" "$@"
+            fi
+        }
+
+        PG_DB_IDENT=$(printf '%s' "$DB_NAME" | sed 's/"/""/g')
+        DB_EXISTS=$(pg_admin_exec -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$(sql_escape "$DB_NAME")';" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ "$DB_EXISTS" != "1" ]; then
+            pg_admin_exec -d postgres -c "CREATE DATABASE \"$PG_DB_IDENT\";"
+            echo "✅ BD '$DB_NAME' creada en PostgreSQL."
+        else
+            echo "✅ BD '$DB_NAME' ya existe; no se elimina ni reinicializa."
+        fi
+
+        if [ -n "$DB_APP_USER" ] && [ "$CREATE_DB_USER" = "1" ]; then
+            PG_USER_IDENT=$(printf '%s' "$DB_APP_USER" | sed 's/"/""/g')
+            if pg_admin_exec -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$(sql_escape "$DB_APP_USER")';" 2>/dev/null | grep -q '^1$'; then
+                if [ -n "$DB_APP_PASS" ]; then
+                    pg_admin_exec -d postgres -c "ALTER ROLE \"$PG_USER_IDENT\" WITH LOGIN PASSWORD '$(sql_escape "$DB_APP_PASS")';"
+                else
+                    pg_admin_exec -d postgres -c "ALTER ROLE \"$PG_USER_IDENT\" WITH LOGIN PASSWORD NULL;"
+                fi
+            else
+                if [ -n "$DB_APP_PASS" ]; then
+                    pg_admin_exec -d postgres -c "CREATE ROLE \"$PG_USER_IDENT\" LOGIN PASSWORD '$(sql_escape "$DB_APP_PASS")';"
+                else
+                    pg_admin_exec -d postgres -c "CREATE ROLE \"$PG_USER_IDENT\" LOGIN;"
+                fi
+            fi
+            case "$GRANT_MODE" in
+                1) pg_admin_exec -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_IDENT\" TO \"$PG_USER_IDENT\";"; pg_admin_exec -d "$DB_NAME" -c "GRANT ALL ON SCHEMA public TO \"$PG_USER_IDENT\";" ;;
+                2) pg_admin_exec -d postgres -c "GRANT CONNECT ON DATABASE \"$PG_DB_IDENT\" TO \"$PG_USER_IDENT\";"; pg_admin_exec -d "$DB_NAME" -c "GRANT USAGE ON SCHEMA public TO \"$PG_USER_IDENT\"; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO \"$PG_USER_IDENT\";" ;;
+            esac
+            echo "✅ Usuario PostgreSQL '$DB_APP_USER' configurado."
+            if [ -n "$DB_APP_PASS" ]; then
+                docker exec -e PGPASSWORD="$DB_APP_PASS" "$DB_CONTAINER" "$PG_BIN" -U "$DB_APP_USER" -d "$DB_NAME" -tAc 'SELECT 1;' >/dev/null 2>&1 || { echo "❌ El usuario PostgreSQL no pudo autenticarse con la contraseña configurada."; exit 1; }
+            else
+                echo "ℹ️ Usuario PostgreSQL creado sin contraseña; la autenticación remota dependerá de pg_hba.conf." 
+            fi
         fi
     fi
 fi
