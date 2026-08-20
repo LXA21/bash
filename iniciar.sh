@@ -427,31 +427,6 @@ EOF
     fi
 }
 
-# Validar referencias COPY/ADD de un Dockerfile generado contra su build.context.
-# No intenta reinterpretar Dockerfiles escritos por el proyecto; solo protege lo que
-# nuestro generador acaba de crear.
-validate_generated_dockerfile_copy_sources() {
-    local dockerfile="$1" ctx="$2" line src src_abs
-    [ -f "$dockerfile" ] || { echo "❌ No existe Dockerfile generado: $dockerfile"; return 1; }
-    while IFS= read -r line; do
-        src=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*(COPY|ADD)[[:space:]]+(--[^[:space:]]+[[:space:]]+)*([^[:space:]]+)([[:space:]]+[^[:space:]]+)?$/\3/')
-        [ -n "$src" ] || continue
-        case "$src" in
-            .|./*) continue ;;
-            http://*|https://*|--from=*) continue ;;
-        esac
-        src_abs="$ctx/$src"
-        if [[ "$src" == *'*'* || "$src" == *'?'* || "$src" == *'['* ]]; then
-            compgen -G "$src_abs" >/dev/null 2>&1 || { echo "❌ Dockerfile generado referencia un patrón inexistente: $src"; return 1; }
-        elif [ ! -e "$src_abs" ]; then
-            echo "❌ Dockerfile generado referencia una ruta inexistente en el contexto: $src"
-            echo "   Contexto: $ctx"
-            return 1
-        fi
-    done < <(grep -E '^[[:space:]]*(COPY|ADD)[[:space:]]+' "$dockerfile" || true)
-    return 0
-}
-
 # Detectar un puerto ya declarado por el proyecto antes de inventar uno.
 detect_app_port() {
     local p=""
@@ -879,7 +854,7 @@ FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY . /app/
 EXPOSE 8080
-CMD ["sh", "-c", "if [ -f app.jar ]; then exec java -jar app.jar; elif jar=$(find target -maxdepth 1 -type f -name '*.jar' -print -quit 2>/dev/null) && [ -n "$jar" ]; then exec java -jar "$jar"; else echo 'No se encontró un JAR ejecutable'; exit 1; fi"]
+CMD ["sh", "-c", "if [ -f app.jar ]; then exec java -jar app.jar; elif jar=$(find target -maxdepth 1 -type f -name '*.jar' -print -quit 2>/dev/null) && [ -n \"$jar\" ]; then exec java -jar \"$jar\"; else echo 'No se encontró un JAR ejecutable'; exit 1; fi"]
 EOF
                             ;;
                         *) echo "❌ No se puede generar de forma segura el Dockerfile de '$svc'."; exit 1;;
@@ -936,12 +911,18 @@ if [ -z "$INSTANCE_COMPOSE_FILE" ]; then
         exit 1
     fi
     # Generar Compose en la copia usando el Dockerfile que se va a desplegar.
-    container_port=80
-    case "$PROJECT_TYPE" in
-        node) container_port=3000 ;;
-        python) container_port=8000 ;;
-        static|php) container_port=80 ;;
-    esac
+    # Si el proyecto ya declara su propio puerto (p. ej. PORT=xxxx en package.json),
+    # se respeta; solo se usa el valor por tecnología como último recurso.
+    if [ -n "${APP_PORT_DETECTED:-}" ]; then
+        container_port="$APP_PORT_DETECTED"
+    else
+        container_port=80
+        case "$PROJECT_TYPE" in
+            node) container_port=3000 ;;
+            python) container_port=8000 ;;
+            static|php) container_port=80 ;;
+        esac
+    fi
     cat > "$INSTANCE_SOURCE/compose.generated.yml" <<EOF
 services:
   app:
@@ -955,6 +936,11 @@ EOF
     INSTANCE_COMPOSE_FILE="$INSTANCE_SOURCE/compose.generated.yml"
     echo "✅ Compose generado para la instancia."
 fi
+
+# 🔴 Propagar el Compose de la instancia a partir de aquí: todo el resto del
+# script (build, up, ps, logs, etc.) debe operar sobre la copia aislada
+# Pn/source, nunca sobre el repositorio original clonado.
+COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
 
 # ------------------------------------------------------------------------------
 # Validación preventiva de Dockerfiles
@@ -1078,14 +1064,14 @@ validate_generated_dockerfiles() {
 validate_generated_dockerfiles
 validate_existing_dockerfile_runtime_paths
 
-if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config >/dev/null; then
+if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" config >/dev/null; then
     echo "❌ El Compose existente/generado no pudo ser resuelto por Docker Compose."
     echo "   No se realizará ningún despliegue."
     exit 1
 fi
 
-COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config)
-mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config --services)
+COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" config)
+mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" config --services)
 [ "${#SERVICES[@]}" -gt 0 ] || { echo "❌ Compose no contiene servicios."; exit 1; }
 
 echo "✅ Compose válido. Servicios detectados:"
@@ -1420,7 +1406,7 @@ render_compose() {
     docker compose \
         --env-file "$INSTANCE_ENV" \
         -f "$COMPOSE_FILE" \
-        --project-directory "$REPO_DIR" \
+        --project-directory "$INSTANCE_SOURCE" \
         -p "$COMPOSE_PROJECT_NAME" \
         config --format json
 }
@@ -1553,7 +1539,7 @@ validate_app_db_configuration
 # Así un error de DB_HOST/DB_PORT/usuario/red se detecta antes de gastar tiempo en el build.
 if grep -qE '^\s*build:' <<<"$COMPOSE_CONFIG"; then
     echo "🔨 Validando/build de los Dockerfiles declarados por Compose..."
-    if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" build; then
+    if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" build; then
         echo "❌ Falló la construcción de una imagen declarada por Compose."
         exit 1
     fi
@@ -1722,10 +1708,12 @@ preflight_images() {
         fi
 
         # 3. ¿Existe Dockerfile en el contenido extraído (incluye .zip_extract)?
-        dockerfile_path=$(find "$INSTANCE_SOURCE" -type f -name "Dockerfile" | head -n 1)
+        #    Reconoce también los generados por el script (Dockerfile.generated,
+        #    Dockerfile.prod, etc.), no solo el nombre exacto "Dockerfile".
+        dockerfile_path=$(find "$INSTANCE_SOURCE" -type f \( -name "Dockerfile" -o -name "Dockerfile.*" \) | head -n 1)
         if [ -n "$dockerfile_path" ]; then
-            echo "🔨 Construyendo imagen '$image' desde $(dirname "$dockerfile_path")..."
-            docker build -t "$image" "$(dirname "$dockerfile_path")"
+            echo "🔨 Construyendo imagen '$image' desde $(dirname "$dockerfile_path") ($(basename "$dockerfile_path"))..."
+            docker build -t "$image" -f "$dockerfile_path" "$(dirname "$dockerfile_path")"
             continue
         fi
 
@@ -1782,7 +1770,7 @@ echo ""
 docker compose \
     --env-file "$INSTANCE_ENV" \
     -f "$COMPOSE_FILE" \
-    --project-directory "$REPO_DIR" \
+    --project-directory "$INSTANCE_SOURCE" \
     -p "$COMPOSE_PROJECT_NAME" \
     up -d --build --remove-orphans
 
@@ -1796,7 +1784,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ]; then
     echo "================================================="
 
     for intento in $(seq 1 60); do
-        DB_CONTAINER=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" ps -q "$DB_SERVICE" 2>/dev/null || true)
+        DB_CONTAINER=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$DB_SERVICE" 2>/dev/null || true)
         [ -n "$DB_CONTAINER" ] && break
         sleep 2
 done
@@ -1858,7 +1846,7 @@ done
             [ -n "$svc" ] || continue
             [ "$svc" = "$DB_SERVICE" ] && continue
             [ "$host" = "$DB_SERVICE" ] || continue
-            cid=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" ps -q "$svc" 2>/dev/null || true)
+            cid=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$svc" 2>/dev/null || true)
             [ -n "$cid" ] || continue
             echo "🔌 Probando conectividad $svc -> $DB_SERVICE ($host:$port)..."
 
@@ -2089,10 +2077,10 @@ fi
 # ------------------------------------------------------------------------------
 # 13. Validación final de aislamiento y estado
 # ------------------------------------------------------------------------------
-FINAL_PS=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" ps --format json 2>/dev/null || true)
+FINAL_PS=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps --format json 2>/dev/null || true)
 printf '%s\n' "$FINAL_PS" > "$CARPETA_DESTINO/containers.json"
 
-RUNNING_COUNT=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" -p "$COMPOSE_PROJECT_NAME" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
+RUNNING_COUNT=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
 EXPECTED_COUNT=${#SERVICES[@]}
 
 if [ "$RUNNING_COUNT" -lt "$EXPECTED_COUNT" ]; then
