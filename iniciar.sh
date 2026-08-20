@@ -274,23 +274,11 @@ for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
     fi
 done
 
-DOCKERFILE_PATH=""
-if [ -n "$BUILD_TARGETS" ]; then
-    while IFS=$'\t' read -r svc ctx df eff; do
-        [ -n "$eff" ] || continue
-        if [ -f "$eff" ] && [ -z "$DOCKERFILE_PATH" ]; then DOCKERFILE_PATH="$eff"; fi
-    done <<< "$BUILD_TARGETS"
-fi
-if [ -z "$DOCKERFILE_PATH" ]; then
-    for f in Dockerfile dockerfile; do
-        if [ -f "$REPO_DIR/$f" ]; then DOCKERFILE_PATH="$REPO_DIR/$f"; break; fi
-    done
-fi
-
 cd "$REPO_DIR"
 
 # ------------------------------------------------------------------------------
 # Resolver TODOS los build.context + build.dockerfile declarados por Compose.
+# IMPORTANTE: esta función debe ejecutarse ANTES de consultar BUILD_TARGETS.
 # ------------------------------------------------------------------------------
 BUILD_TARGETS=""
 resolve_compose_build_targets() {
@@ -321,6 +309,28 @@ PYJSON
     rm -f "$json_file"
 }
 resolve_compose_build_targets
+
+# Resolver el Dockerfile principal después de haber obtenido BUILD_TARGETS.
+# Si Compose declara múltiples builds, se conserva el primer Dockerfile válido
+# encontrado para el análisis general; cada servicio se procesa posteriormente
+# mediante BUILD_TARGETS.
+DOCKERFILE_PATH=""
+if [ -n "$BUILD_TARGETS" ]; then
+    while IFS=$'\t' read -r svc ctx df eff; do
+        [ -n "$eff" ] || continue
+        if [ -f "$eff" ] && [ -z "$DOCKERFILE_PATH" ]; then
+            DOCKERFILE_PATH="$eff"
+        fi
+    done <<< "$BUILD_TARGETS"
+fi
+if [ -z "$DOCKERFILE_PATH" ]; then
+    for f in Dockerfile dockerfile; do
+        if [ -f "$REPO_DIR/$f" ]; then
+            DOCKERFILE_PATH="$REPO_DIR/$f"
+            break
+        fi
+    done
+fi
 
 echo "================================================="
 echo "🔎 1. Analizando proyecto y configuración Docker"
