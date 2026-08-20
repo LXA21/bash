@@ -391,6 +391,63 @@ detect_service_type() {
     echo "$PROJECT_TYPE"
 }
 
+# Determinar el servidor web cuando hay que GENERAR Docker y no existe Compose.
+# Si la evidencia es contradictoria, no inventamos una arquitectura.
+detect_local_web_stack() {
+    local root="$1" n=0 a=0
+    if find "$root" -maxdepth 4 -type f \
+        \( -iname 'nginx.conf' -o -iname '*nginx*.conf' -o -iname 'openresty.conf' \) \
+        -print -quit 2>/dev/null | grep -q .; then n=1; fi
+    if find "$root" -maxdepth 4 -type f \
+        \( -iname 'httpd.conf' -o -iname 'apache2.conf' -o -iname '*apache*.conf' \) \
+        -print -quit 2>/dev/null | grep -q .; then a=1; fi
+    if [ "$n" -eq 1 ] && [ "$a" -eq 1 ]; then echo nginx+apache;
+    elif [ "$n" -eq 1 ]; then echo nginx;
+    elif [ "$a" -eq 1 ]; then echo apache;
+    else echo unknown; fi
+}
+
+# Añadir permisos SOLO para directorios que existen en el contexto real.
+# La comprobación [ -d ] también protege el build si .dockerignore excluye alguno.
+append_php_runtime_permissions() {
+    local ctx="$1" target="$2" candidate paths=""
+    for candidate in storage bootstrap/cache var runtime writable api/events; do
+        if [ -d "$ctx/$candidate" ]; then
+            paths="$paths /var/www/html/$candidate"
+        fi
+    done
+    if [ -n "$paths" ]; then
+        cat >> "$target" <<EOF
+RUN set -eux; for d in $paths; do if [ -d "\$d" ]; then chown -R www-data:www-data "\$d"; chmod -R 775 "\$d"; fi; done
+EOF
+    fi
+}
+
+# Validar referencias COPY/ADD de un Dockerfile generado contra su build.context.
+# No intenta reinterpretar Dockerfiles escritos por el proyecto; solo protege lo que
+# nuestro generador acaba de crear.
+validate_generated_dockerfile_copy_sources() {
+    local dockerfile="$1" ctx="$2" line src src_abs
+    [ -f "$dockerfile" ] || { echo "❌ No existe Dockerfile generado: $dockerfile"; return 1; }
+    while IFS= read -r line; do
+        src=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*(COPY|ADD)[[:space:]]+(--[^[:space:]]+[[:space:]]+)*([^[:space:]]+)([[:space:]]+[^[:space:]]+)?$/\3/')
+        [ -n "$src" ] || continue
+        case "$src" in
+            .|./*) continue ;;
+            http://*|https://*|--from=*) continue ;;
+        esac
+        src_abs="$ctx/$src"
+        if [[ "$src" == *'*'* || "$src" == *'?'* || "$src" == *'['* ]]; then
+            compgen -G "$src_abs" >/dev/null 2>&1 || { echo "❌ Dockerfile generado referencia un patrón inexistente: $src"; return 1; }
+        elif [ ! -e "$src_abs" ]; then
+            echo "❌ Dockerfile generado referencia una ruta inexistente en el contexto: $src"
+            echo "   Contexto: $ctx"
+            return 1
+        fi
+    done < <(grep -E '^[[:space:]]*(COPY|ADD)[[:space:]]+' "$dockerfile" || true)
+    return 0
+}
+
 # Detectar un puerto ya declarado por el proyecto antes de inventar uno.
 detect_app_port() {
     local p=""
@@ -421,12 +478,23 @@ generate_dockerfile_if_missing() {
     echo "🛠️ No existe Dockerfile ni Compose. Se generará un Dockerfile a partir de la estructura detectada."
     case "$PROJECT_TYPE" in
         node)
+            if ! python3 - "$REPO_DIR/package.json" <<'PYNODE'
+import json, sys
+p=json.load(open(sys.argv[1], encoding='utf-8'))
+scripts=p.get('scripts') or {}
+if 'start' not in scripts:
+    raise SystemExit(1)
+PYNODE
+            then
+                echo "❌ Node detectado, pero package.json no define scripts.start."
+                echo "   No se generará un CMD arbitrario que pueda dejar el contenedor en bucle de reinicio."
+                exit 1
+            fi
             cat > "$REPO_DIR/Dockerfile.generated" <<'EOF'
 FROM node:20-alpine
 WORKDIR /app
-COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY . .
+RUN if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; else echo 'No se encontró package.json'; exit 1; fi
 ENV NODE_ENV=production
 EXPOSE 3000
 CMD ["npm", "start"]
@@ -434,12 +502,43 @@ EOF
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
             ;;
         php)
-            if [ -n "$COMPOSE_FILE" ] && grep -Eqi 'nginx|openresty' "$COMPOSE_FILE"; then
+            # PHP generado de forma conservadora: nunca se asumen rutas de
+            # Laravel/Symfony/u otro framework que no existan en el proyecto.
+            php_web_mode=""
+            if [ -n "$COMPOSE_FILE" ]; then
+                if grep -Eqi 'nginx|openresty|php-fpm|fpm' "$COMPOSE_FILE"; then php_web_mode="fpm";
+                elif grep -Eqi 'apache|httpd' "$COMPOSE_FILE"; then php_web_mode="apache"; fi
+            else
+                local_web_stack=$(detect_local_web_stack "$REPO_DIR")
+                case "$local_web_stack" in
+                    nginx) php_web_mode="fpm" ;;
+                    apache) php_web_mode="apache" ;;
+                    nginx+apache)
+                        echo "⚠️ Se detectaron Nginx y Apache en el proyecto sin Compose."
+                        read -r -p "👉 Arquitectura PHP [1=Apache, 2=Nginx+PHP-FPM]: " web_choice
+                        case "${web_choice:-}" in 1) php_web_mode="apache" ;; 2) php_web_mode="fpm" ;; *) echo "❌ Selección inválida."; exit 1 ;; esac
+                        ;;
+                    *)
+                        echo "⚠️ PHP detectado, pero no se encontró configuración web suficiente."
+                        read -r -p "👉 Servidor web [1=Apache, 2=Nginx+PHP-FPM]: " web_choice
+                        case "${web_choice:-}" in 1) php_web_mode="apache" ;; 2) php_web_mode="fpm" ;; *) echo "❌ Selección inválida."; exit 1 ;; esac
+                        ;;
+                esac
+            fi
+            if [ "$php_web_mode" = "fpm" ]; then
                 cat > "$REPO_DIR/Dockerfile.generated" <<'EOF'
 FROM php:8.2-fpm
 WORKDIR /var/www/html
 COPY . /var/www/html/
-RUN if [ -f composer.json ]; then apt-get update && apt-get install -y git unzip libzip-dev && docker-php-ext-install zip && rm -rf /var/lib/apt/lists/* && php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && php composer-setup.php --install-dir=/usr/local/bin --filename=composer && rm composer-setup.php && composer install --no-interaction --prefer-dist --no-dev; fi
+RUN if [ -f /var/www/html/composer.json ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git unzip libzip-dev && \
+      docker-php-ext-install zip && \
+      rm -rf /var/lib/apt/lists/* && \
+      php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+      php composer-setup.php --install-dir=/usr/local/bin --filename=composer && \
+      rm composer-setup.php && \
+      composer install --no-interaction --prefer-dist --no-dev; \
+    fi
 EXPOSE 9000
 CMD ["php-fpm"]
 EOF
@@ -448,22 +547,42 @@ EOF
 FROM php:8.2-apache
 WORKDIR /var/www/html
 COPY . /var/www/html/
-RUN if [ -f composer.json ]; then apt-get update && apt-get install -y git unzip libzip-dev && docker-php-ext-install zip && rm -rf /var/lib/apt/lists/* && php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && php composer-setup.php --install-dir=/usr/local/bin --filename=composer && rm composer-setup.php && composer install --no-interaction --prefer-dist --no-dev; fi
+RUN if [ -f /var/www/html/composer.json ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git unzip libzip-dev && \
+      docker-php-ext-install zip && \
+      rm -rf /var/lib/apt/lists/* && \
+      php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+      php composer-setup.php --install-dir=/usr/local/bin --filename=composer && \
+      rm composer-setup.php && \
+      composer install --no-interaction --prefer-dist --no-dev; \
+    fi
 EXPOSE 80
 CMD ["apache2-foreground"]
 EOF
             fi
+            append_php_runtime_permissions "$REPO_DIR" "$REPO_DIR/Dockerfile.generated"
+            GENERATED_PHP_WEB_MODE="$php_web_mode"
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
             ;;
         python)
-            cat > "$REPO_DIR/Dockerfile.generated" <<'EOF'
+            if [ ! -f "$REPO_DIR/app.py" ] && [ ! -f "$REPO_DIR/manage.py" ] && [ ! -f "$REPO_DIR/main.py" ]; then
+                echo "❌ Python detectado, pero no se encontró un punto de entrada seguro (app.py, manage.py o main.py)."
+                exit 1
+            fi
+            if [ -f "$REPO_DIR/manage.py" ]; then
+                python_cmd='python manage.py runserver 0.0.0.0:8000'
+            elif [ -f "$REPO_DIR/main.py" ]; then
+                python_cmd='python main.py'
+            else
+                python_cmd='python app.py'
+            fi
+            cat > "$REPO_DIR/Dockerfile.generated" <<EOF
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt* pyproject.toml* ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 COPY . .
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 EXPOSE 8000
-CMD ["python", "app.py"]
+CMD ["sh", "-c", "$python_cmd"]
 EOF
             DOCKERFILE_PATH="$REPO_DIR/Dockerfile.generated"
             ;;
@@ -484,6 +603,7 @@ EOF
     echo "✅ Dockerfile generado: ${DOCKERFILE_PATH#$REPO_DIR/}"
 }
 
+GENERATED_PHP_WEB_MODE=""
 generate_dockerfile_if_missing
 
 # Genera solamente los archivos Docker que realmente faltan. Los existentes se respetan.
@@ -594,24 +714,67 @@ if [ -n "$BUILD_TARGETS" ]; then
                     service_type=$(detect_service_type "$svc" "$ctx")
                     echo "   🧩 Tecnología para '$svc': $service_type"
                     case "$service_type" in
-                        node) cat > "$target" <<'EOF'
+                        node)
+                            if ! python3 - "$ctx/package.json" <<'PYNODE'
+import json, sys
+p=json.load(open(sys.argv[1], encoding='utf-8'))
+if 'start' not in (p.get('scripts') or {}):
+    raise SystemExit(1)
+PYNODE
+                            then
+                                echo "❌ Node en '$svc' no define scripts.start en package.json."
+                                exit 1
+                            fi
+                            cat > "$target" <<'EOF'
 FROM node:20-alpine
 WORKDIR /app
-COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY . .
+RUN if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; else echo 'No se encontró package.json'; exit 1; fi
 ENV NODE_ENV=production
 EXPOSE 3000
 CMD ["npm", "start"]
 EOF
                             ;;
                         php)
-                            if grep -Eqi 'nginx|openresty' "$COMPOSE_FILE" 2>/dev/null || [[ "$svc" =~ nginx|fpm ]]; then
+                            # Nunca introducir chown/chmod sobre rutas asumidas.
+                            # Las rutas de permisos se calculan desde el contexto real
+                            # y, aun así, se protegen con [ -d ] durante el build.
+                            php_web_mode=""
+                            if grep -Eqi 'nginx|openresty|php-fpm|fpm' "$COMPOSE_FILE" 2>/dev/null || [[ "$svc" =~ nginx|fpm ]]; then
+                                php_web_mode="fpm"
+                            elif grep -Eqi 'apache|httpd' "$COMPOSE_FILE" 2>/dev/null || [[ "$svc" =~ apache|httpd ]]; then
+                                php_web_mode="apache"
+                            else
+                                local_web_stack=$(detect_local_web_stack "$ctx")
+                                case "$local_web_stack" in
+                                    nginx) php_web_mode="fpm" ;;
+                                    apache) php_web_mode="apache" ;;
+                                    nginx+apache)
+                                        echo "⚠️ $svc: se detectaron Nginx y Apache sin una indicación clara."
+                                        read -r -p "👉 Arquitectura PHP para '$svc' [1=Apache, 2=Nginx+PHP-FPM]: " web_choice
+                                        case "${web_choice:-}" in 1) php_web_mode="apache" ;; 2) php_web_mode="fpm" ;; *) echo "❌ Selección inválida."; exit 1 ;; esac
+                                        ;;
+                                    *)
+                                        echo "⚠️ $svc: PHP sin servidor web determinable."
+                                        read -r -p "👉 Servidor web para '$svc' [1=Apache, 2=Nginx+PHP-FPM]: " web_choice
+                                        case "${web_choice:-}" in 1) php_web_mode="apache" ;; 2) php_web_mode="fpm" ;; *) echo "❌ Selección inválida."; exit 1 ;; esac
+                                        ;;
+                                esac
+                            fi
+                            if [ "$php_web_mode" = "fpm" ]; then
                                 cat > "$target" <<'EOF'
 FROM php:8.2-fpm
 WORKDIR /var/www/html
 COPY . /var/www/html/
-RUN if [ -f composer.json ]; then apt-get update && apt-get install -y git unzip libzip-dev && docker-php-ext-install zip && rm -rf /var/lib/apt/lists/* && php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && php composer-setup.php --install-dir=/usr/local/bin --filename=composer && rm composer-setup.php && composer install --no-interaction --prefer-dist --no-dev; fi
+RUN if [ -f /var/www/html/composer.json ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git unzip libzip-dev && \
+      docker-php-ext-install zip && \
+      rm -rf /var/lib/apt/lists/* && \
+      php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+      php composer-setup.php --install-dir=/usr/local/bin --filename=composer && \
+      rm composer-setup.php && \
+      composer install --no-interaction --prefer-dist --no-dev; \
+    fi
 EXPOSE 9000
 CMD ["php-fpm"]
 EOF
@@ -620,20 +783,40 @@ EOF
 FROM php:8.2-apache
 WORKDIR /var/www/html
 COPY . /var/www/html/
-RUN if [ -f composer.json ]; then apt-get update && apt-get install -y git unzip libzip-dev && docker-php-ext-install zip && rm -rf /var/lib/apt/lists/* && php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && php composer-setup.php --install-dir=/usr/local/bin --filename=composer && rm composer-setup.php && composer install --no-interaction --prefer-dist --no-dev; fi
+RUN if [ -f /var/www/html/composer.json ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git unzip libzip-dev && \
+      docker-php-ext-install zip && \
+      rm -rf /var/lib/apt/lists/* && \
+      php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" && \
+      php composer-setup.php --install-dir=/usr/local/bin --filename=composer && \
+      rm composer-setup.php && \
+      composer install --no-interaction --prefer-dist --no-dev; \
+    fi
 EXPOSE 80
 CMD ["apache2-foreground"]
 EOF
                             fi
+                            append_php_runtime_permissions "$ctx" "$target"
                             ;;
-                        python) cat > "$target" <<'EOF'
+                        python)
+                            if [ ! -f "$ctx/app.py" ] && [ ! -f "$ctx/manage.py" ] && [ ! -f "$ctx/main.py" ]; then
+                                echo "❌ Python en '$svc' no tiene un punto de entrada seguro (app.py, manage.py o main.py)."
+                                exit 1
+                            fi
+                            if [ -f "$ctx/manage.py" ]; then
+                                python_cmd='python manage.py runserver 0.0.0.0:8000'
+                            elif [ -f "$ctx/main.py" ]; then
+                                python_cmd='python main.py'
+                            else
+                                python_cmd='python app.py'
+                            fi
+                            cat > "$target" <<EOF
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt* pyproject.toml* ./
-RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 COPY . .
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 EXPOSE 8000
-CMD ["python", "app.py"]
+CMD ["sh", "-c", "$python_cmd"]
 EOF
                             ;;
                         static) cat > "$target" <<'EOF'
@@ -650,11 +833,9 @@ COPY nginx.conf /etc/nginx/nginx.conf
 EXPOSE 80
 EOF
                             else
-                                cat > "$target" <<'EOF'
-FROM nginx:alpine
-COPY . /etc/nginx/conf.d/
-EXPOSE 80
-EOF
+                                echo "❌ No existe nginx.conf para el servicio '$svc'."
+                                echo "   No se generará una configuración Nginx inventada porque podría romper el enrutamiento."
+                                exit 1
                             fi
                             ;;
                         apache)
@@ -673,7 +854,7 @@ EOF
                             else
                                 cat > "$target" <<'EOF'
 FROM httpd:2.4
-COPY . /usr/local/apache2/conf/
+COPY . /usr/local/apache2/htdocs/
 EXPOSE 80
 EOF
                             fi
@@ -684,7 +865,7 @@ FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY . /app/
 EXPOSE 8080
-CMD ["sh", "-c", "if [ -f app.jar ]; then exec java -jar app.jar; elif [ -f target/*.jar ]; then exec java -jar target/*.jar; else echo 'No se encontró un JAR ejecutable'; exit 1; fi"]
+CMD ["sh", "-c", "if [ -f app.jar ]; then exec java -jar app.jar; elif jar=$(find target -maxdepth 1 -type f -name '*.jar' -print -quit 2>/dev/null) && [ -n "$jar" ]; then exec java -jar "$jar"; else echo 'No se encontró un JAR ejecutable'; exit 1; fi"]
 EOF
                             ;;
                         *) echo "❌ No se puede generar de forma segura el Dockerfile de '$svc'."; exit 1;;
@@ -730,6 +911,15 @@ echo "🌐 Arquitectura web detectada: $WEB_STACK"
 
 INSTANCE_COMPOSE_FILE="${INSTANCE_COMPOSE_FILE:-}"
 if [ -z "$INSTANCE_COMPOSE_FILE" ]; then
+    # Si generamos PHP-FPM sin Compose, no es seguro inventar una topología HTTP: PHP-FPM
+    # escucha FastCGI y necesita Nginx/otro servidor web delante. Detener aquí evita el
+    # error predecible de publicar host:80 contra un contenedor que solo escucha 9000.
+    if [ "$PROJECT_TYPE" = "php" ] && [ "${GENERATED_PHP_WEB_MODE:-apache}" = "fpm" ]; then
+        echo "❌ Se detectó PHP-FPM pero el proyecto no trae Compose."
+        echo "   Para no inventar una arquitectura Nginx/PHP-FPM incorrecta, el despliegue se detiene."
+        echo "   Añade un Compose existente o una configuración Nginx/Apache completa para que el script pueda respetarla."
+        exit 1
+    fi
     # Generar Compose en la copia usando el Dockerfile que se va a desplegar.
     container_port=80
     case "$PROJECT_TYPE" in
@@ -751,10 +941,50 @@ EOF
     echo "✅ Compose generado para la instancia."
 fi
 
+# Validación preventiva de Dockerfiles generados.
+# No sustituye docker build: evita errores obvios por COPY/ADD inexistentes
+# y detecta referencias de rutas absolutas generadas sin existir en la imagen.
+validate_generated_dockerfiles() {
+    local svc ctx df eff rel
+    if [ -n "${BUILD_TARGETS:-}" ]; then
+        while IFS=$'\t' read -r svc ctx df eff; do
+            [ -n "$svc" ] || continue
+            case "$eff" in
+                "$REPO_DIR_ORIGINAL"/*) rel="${eff#$REPO_DIR_ORIGINAL/}" ;;
+                *) continue ;;
+            esac
+            [ -f "$INSTANCE_SOURCE/$rel" ] || { echo "❌ Falta el Dockerfile de '$svc': $rel"; return 1; }
+            if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$INSTANCE_SOURCE/$rel"; then
+                echo "❌ Se detectó la instrucción antigua insegura en '$rel'."
+                return 1
+            fi
+            if grep -qE 'php:(8\.[0-9]+|[0-9]+\.)' "$INSTANCE_SOURCE/$rel" && grep -qE 'chown -R www-data:www-data' "$INSTANCE_SOURCE/$rel"; then
+                grep -q '\[ -d "\$d" \]' "$INSTANCE_SOURCE/$rel" || { echo "❌ Permisos PHP no protegidos contra directorios inexistentes: $rel"; return 1; }
+            fi
+            if ! validate_generated_dockerfile_copy_sources "$INSTANCE_SOURCE/$rel" "$ctx"; then return 1; fi
+        done <<< "$BUILD_TARGETS"
+    elif [ -n "${INSTANCE_DOCKERFILE_PATH:-}" ] && [ -f "$INSTANCE_DOCKERFILE_PATH" ]; then
+        # Compose generado: el contexto es la raíz de la instancia.
+        if [[ "$INSTANCE_DOCKERFILE_PATH" == "$INSTANCE_SOURCE/"* ]]; then
+            if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$INSTANCE_DOCKERFILE_PATH"; then
+                echo "❌ Se detectó la instrucción antigua insegura en el Dockerfile generado."
+                return 1
+            fi
+            if grep -qE 'php:(8\.[0-9]+|[0-9]+\.)' "$INSTANCE_DOCKERFILE_PATH" && grep -qE 'chown -R www-data:www-data' "$INSTANCE_DOCKERFILE_PATH"; then
+                grep -q '\[ -d "\$d" \]' "$INSTANCE_DOCKERFILE_PATH" || { echo "❌ Permisos PHP no protegidos en Dockerfile generado."; return 1; }
+            fi
+            validate_generated_dockerfile_copy_sources "$INSTANCE_DOCKERFILE_PATH" "$INSTANCE_SOURCE" || return 1
+        fi
+    fi
+    return 0
+}
+
 # Si ya existe Compose, NO se reescribe. Solo se valida y se interpreta.
 COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
 REPO_DIR_ORIGINAL="$REPO_DIR"
 REPO_DIR="$INSTANCE_SOURCE"
+
+validate_generated_dockerfiles
 
 if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config >/dev/null; then
     echo "❌ El Compose existente/generado no pudo ser resuelto por Docker Compose."
