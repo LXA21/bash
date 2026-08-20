@@ -202,7 +202,7 @@ echo "📥 0.3 Obteniendo repositorio"
 echo "================================================="
 
 extract_repository_zip() {
-    local zip_file="$1" dest="$2" extract_dir top_count top_dir
+    local zip_file="$1" dest="$2" extract_dir top_dir depth
     extract_dir=$(mktemp -d)
 
     echo "📦 Extrayendo repositorio ZIP..."
@@ -212,12 +212,20 @@ extract_repository_zip() {
         exit 1
     fi
 
-    top_count=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
-    if [ "$top_count" = "1" ] && [ "$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = "0" ]; then
-        top_dir=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
-    else
-        top_dir="$extract_dir"
-    fi
+    # CORRECCIÓN: navegar recursivamente mientras el nivel actual sea
+    # exactamente UNA carpeta envolvente sin archivos sueltos. Esto evita el
+    # error de "el sistema quedó dentro de una carpeta" cuando el ZIP anida
+    # el proyecto en dos o más niveles (p. ej. export/export/sistema-real/...).
+    top_dir="$extract_dir"
+    for depth in 1 2 3 4 5; do
+        if [ "$(find "$top_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = "1" ] && \
+           [ "$(find "$top_dir" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = "0" ]; then
+            top_dir=$(find "$top_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
+            echo "   ↳ Carpeta envolvente detectada, navegando dentro: $(basename "$top_dir")"
+        else
+            break
+        fi
+    done
 
     mkdir -p "$dest"
     tar -C "$top_dir" -cf - . | tar -C "$dest" -xf -
@@ -666,6 +674,29 @@ extract_embedded_zips() {
             if ! unzip -oq "$zip_file" -d "$out_dir"; then
                 echo "❌ No se pudo extraer: ${zip_file#$INSTANCE_SOURCE/}"
                 return 1
+            fi
+
+            # CORRECCIÓN: igual que con el ZIP del repositorio, navegar dentro
+            # de carpetas envolventes anidadas para que el contenido real
+            # (Dockerfile, compose, .sql, etc.) quede accesible y no atrapado
+            # dentro de una subcarpeta extra.
+            local inner_depth inner_dir="$out_dir"
+            for inner_depth in 1 2 3 4 5; do
+                if [ "$(find "$inner_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = "1" ] && \
+                   [ "$(find "$inner_dir" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = "0" ]; then
+                    inner_dir=$(find "$inner_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
+                else
+                    break
+                fi
+            done
+            if [ "$inner_dir" != "$out_dir" ]; then
+                echo "   ↳ Carpeta envolvente detectada dentro del paquete, aplanando estructura."
+                local flat_tmp
+                flat_tmp=$(mktemp -d)
+                tar -C "$inner_dir" -cf - . | tar -C "$flat_tmp" -xf -
+                rm -rf "${out_dir:?}"/*
+                tar -C "$flat_tmp" -cf - . | tar -C "$out_dir" -xf -
+                rm -rf "$flat_tmp"
             fi
         done < <(find "$INSTANCE_SOURCE" -type f -iname '*.zip' ! -path '*/.git/*' -print0)
 
@@ -1213,8 +1244,13 @@ if [ -n "$DB_SERVICE" ]; then
     fi
 
     if [ "$DB_MODE" = "2" ]; then
-        echo "🔎 Buscando archivos SQL dentro del contenido extraído (incluidos paquetes ZIP internos)..."
-        mapfile -t SQL_FILES < <(find "$REPO_DIR" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' | sort)
+        # CORRECCIÓN: la búsqueda debe hacerse sobre $INSTANCE_SOURCE, porque
+        # es ahí (no en $REPO_DIR) donde los ZIP internos ya fueron
+        # descomprimidos por extract_embedded_zips (carpeta .zip_extract).
+        # Buscar en $REPO_DIR se saltaba cualquier .sql que viniera empaquetado
+        # dentro de un .zip del repositorio.
+        echo "🔎 Buscando archivos SQL dentro del contenido ya descomprimido (incluidos paquetes ZIP internos)..."
+        mapfile -t SQL_FILES < <(find "$INSTANCE_SOURCE" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' | sort)
 
         if [ "${#SQL_FILES[@]}" -eq 0 ]; then
             echo "⚠️ Se seleccionó importar SQL, pero no se encontró ningún archivo .sql/.sql.gz."
@@ -1235,14 +1271,14 @@ if [ -n "$DB_SERVICE" ]; then
 
             if [ -n "$PREFERRED_SQL" ]; then
                 SQL_FILE="$PREFERRED_SQL"
-                echo "📄 SQL inicial detectado: ${SQL_FILE#$REPO_DIR/}"
+                echo "📄 SQL inicial detectado: ${SQL_FILE#$INSTANCE_SOURCE/}"
             elif [ "${#SQL_FILES[@]}" -eq 1 ]; then
                 SQL_FILE="${SQL_FILES[0]}"
-                echo "📄 SQL detectado: ${SQL_FILE#$REPO_DIR/}"
+                echo "📄 SQL detectado: ${SQL_FILE#$INSTANCE_SOURCE/}"
             else
-                echo "📄 SQL encontrados en el repositorio extraído:"
+                echo "📄 SQL encontrados en el contenido descomprimido:"
                 for i in "${!SQL_FILES[@]}"; do
-                    echo "   $((i+1))) ${SQL_FILES[$i]#$REPO_DIR/}"
+                    echo "   $((i+1))) ${SQL_FILES[$i]#$INSTANCE_SOURCE/}"
                 done
                 read -r -p "👉 Selección [1]: " SQL_INDEX
                 SQL_INDEX=${SQL_INDEX:-1}
@@ -1831,7 +1867,47 @@ done
     done
 
     [ "$DB_READY" -eq 1 ] || { echo "❌ La BD no llegó a estar disponible."; exit 1; }
-    echo "✅ Base de datos lista."
+
+    # CORRECCIÓN CRUCIAL: un ping exitoso no garantiza que la BD esté lista
+    # para enlazar. MySQL/MariaDB arrancan primero un servidor TEMPORAL para
+    # ejecutar la inicialización (creación de datadir, scripts, etc.) y luego
+    # se reinician para levantar el servidor DEFINITIVO. Si el ping atrapa el
+    # servidor temporal, la conexión puede caerse segundos después justo
+    # cuando se intenta crear la BD o importar el SQL.
+    #
+    # Por eso: tras el primer ping exitoso, esperamos el tiempo de enlace
+    # (10-15s) y volvemos a verificar que la BD SIGA respondiendo antes de
+    # continuar. Si en ese lapso el servidor se reinició, se reintenta la
+    # espera completa.
+    echo "⏳ Primer ping recibido. Esperando estabilización del enlace (10-15s) antes de continuar..."
+    DB_STABLE=0
+    for intento_estable in 1 2 3; do
+        sleep 12
+        case "$DB_ENGINE" in
+            mysql|mariadb)
+                if docker exec "$DB_CONTAINER" mariadb-admin ping -u root --silent >/dev/null 2>&1 || \
+                   docker exec "$DB_CONTAINER" mysqladmin ping -u root --silent >/dev/null 2>&1 || \
+                   { [ -n "$ROOT_PASSWORD_DETECTED" ] && docker exec "$DB_CONTAINER" mariadb-admin ping -u root -p"$ROOT_PASSWORD_DETECTED" --silent >/dev/null 2>&1; } || \
+                   { [ -n "$ROOT_PASSWORD_DETECTED" ] && docker exec "$DB_CONTAINER" mysqladmin ping -u root -p"$ROOT_PASSWORD_DETECTED" --silent >/dev/null 2>&1; }; then
+                    DB_STABLE=1
+                fi
+                ;;
+            postgres)
+                docker exec "$DB_CONTAINER" pg_isready >/dev/null 2>&1 && DB_STABLE=1 || true
+                ;;
+            *)
+                DB_STABLE=1
+                ;;
+        esac
+        if [ "$DB_STABLE" -eq 1 ]; then
+            DB_STATUS=$(docker inspect -f '{{.State.Status}}' "$DB_CONTAINER" 2>/dev/null || echo desconocido)
+            [ "$DB_STATUS" = "running" ] && break
+            DB_STABLE=0
+        fi
+        echo "   ⚠️ La BD aún se está reiniciando/estabilizando (intento $intento_estable/3)..."
+    done
+    [ "$DB_STABLE" -eq 1 ] || { echo "❌ La BD no logró estabilizarse tras el enlace inicial."; exit 1; }
+    echo "✅ Base de datos lista y enlace estable."
 
     # --------------------------------------------------------------------------
     # 11.1 Comprobación REAL de red app -> BD
@@ -2139,7 +2215,7 @@ echo "🔧 Motor BD             : ${DB_ENGINE:-No determinado}"
 echo "💾 Base de datos        : ${DB_NAME:-No gestionada}"
 if [ "$DB_MODE" = "2" ]; then
     if [ -n "$SQL_FILE" ]; then
-        echo "📄 SQL inicial          : ${SQL_FILE#$REPO_DIR/}"
+        echo "📄 SQL inicial          : ${SQL_FILE#$INSTANCE_SOURCE/}"
     else
         echo "📄 SQL inicial          : No encontrado (se omitió importación)"
     fi
