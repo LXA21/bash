@@ -262,6 +262,15 @@ extract_repository_zip() {
         exit 1
     fi
 
+    # Normalizar permisos aditivamente ANTES de copiar al destino final: los
+    # ZIP preservan el modo original de cada entrada, que puede venir
+    # restrictivo (000, sin +x en directorios) según la herramienta que
+    # generó el ZIP. Sin esto, el contenedor web puede levantar "sano" pero
+    # Apache/Nginx responde 403 Forbidden al no poder leer/atravesar los
+    # archivos, incluso después de un chown correcto en el Dockerfile.
+    find "$top_dir" -type d -exec chmod u+rwx,go+rx {} \; 2>/dev/null || true
+    find "$top_dir" -type f -exec chmod u+rw,go+r {} \; 2>/dev/null || true
+
     mkdir -p "$dest"
     tar -C "$top_dir" -cf - . | tar -C "$dest" -xf -
     rm -rf "$extract_dir"
@@ -707,6 +716,24 @@ printf '\nCOMPOSE_PROJECT_NAME=%s\nPREFIX_CONTENEDOR=%s\nPROJECT_NAME=%s\nPROJEC
 
 mkdir -p "$INSTANCE_SOURCE"
 tar -C "$REPO_DIR" --exclude='./.git' -cf - . | tar -C "$INSTANCE_SOURCE" -xf -
+
+# CORRECCIÓN CRÍTICA (permisos "403 Forbidden" en el contenedor web):
+# COPY en un Dockerfile preserva LITERALMENTE los permisos que traían los
+# archivos en el ZIP o repositorio original. Como este instalador es
+# "universal" (acepta cualquier repo/ZIP de cualquier origen), no se puede
+# asumir que todos vengan con permisos sanos: algunos paneles de exportación
+# o ZIPs generados en otros sistemas guardan modos restrictivos (000, 600 sin
+# +x en directorios, etc.). chown en el Dockerfile del proyecto cambia el
+# dueño pero NO el modo, así que si Apache/Nginx corre como www-data pero el
+# archivo quedó en modo 000, ni el nuevo dueño puede leerlo -> 403 Forbidden
+# "You don't have permission to access this resource".
+# Se normalizan permisos de forma ADITIVA (nunca se quita nada, solo se
+# añade lectura a todos y ejecución/traspaso a directorios), para que
+# cualquier imagen construida a partir de esta fuente sea servible sin
+# depender de que el Dockerfile de cada proyecto lo corrija por su cuenta.
+echo "🔐 Normalizando permisos de la fuente copiada (evita 403 Forbidden por permisos heredados del ZIP/repo)..."
+find "$INSTANCE_SOURCE" -type d -exec chmod u+rwx,go+rx {} \; 2>/dev/null || true
+find "$INSTANCE_SOURCE" -type f -exec chmod u+rw,go+r {} \; 2>/dev/null || true
 
 # Mantener exactamente el Compose que venía en el repositorio, pero apuntando
 # a la copia de la instancia. Nunca sustituirlo por compose.generated.yml.
