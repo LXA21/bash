@@ -1,4 +1,4 @@
-#!/bin/bash
+!/bin/bash
 set -Eeuo pipefail
 
 # ============================================================================== 
@@ -794,13 +794,58 @@ extract_embedded_zips() {
                 tar -C "$flat_tmp" -cf - . | tar -C "$out_dir" -xf -
                 rm -rf "$flat_tmp"
             fi
-        done < <(find "$INSTANCE_SOURCE" -type f -iname '*.zip' ! -path '*/.git/*' -print0)
+
+            # CORRECCIÓN CRÍTICA: dejar el contenido solo en .zip_extract/<hash>/
+            # no sirve de nada si el Dockerfile del proyecto hace "COPY . ..."
+            # desde la raíz de la instancia — el código real (index.php, etc.)
+            # nunca llega al servidor web, que es exactamente lo que causaba el
+            # 403/listado vacío. Se FUSIONA el contenido extraído hacia la raíz
+            # de la instancia (sin pisar archivos que el propio repo ya trae,
+            # como un Dockerfile o docker-compose.yml legítimos) para que quede
+            # donde cualquier Dockerfile ("COPY . /var/www/html/", "COPY . .",
+            # etc.) lo vaya a encontrar, sin importar la estructura del proyecto.
+            echo "   ↳ Integrando contenido del paquete a la raíz de la instancia..."
+            tar -C "$out_dir" -cf - . | tar -C "$INSTANCE_SOURCE" -k -xf - 2>/dev/null || true
+
+            # El .zip original ya fue extraído e integrado: no debe terminar
+            # dentro de la imagen de Docker (no aporta nada al contenedor y
+            # puede confundirse con contenido real). Se marca para exclusión
+            # vía .dockerignore más abajo; aquí solo se registra la ruta.
+            EMBEDDED_ZIP_SOURCES="${EMBEDDED_ZIP_SOURCES}${zip_file#$INSTANCE_SOURCE/}"$'\n'
+        done < <(find "$INSTANCE_SOURCE" -type f -iname '*.zip' ! -path '*/.git/*' ! -path '*/.zip_extract/*' -print0)
 
         [ "$found" -eq 0 ] && break
     done
 }
 
+EMBEDDED_ZIP_SOURCES=""
 extract_embedded_zips
+
+# ------------------------------------------------------------------------------
+# 2.0 .dockerignore universal: evita que archivos del INSTALADOR (no de la
+# app) terminen dentro de la imagen, sin importar el Dockerfile del proyecto.
+# ------------------------------------------------------------------------------
+# Esto es aditivo: si el repo ya trae su propio .dockerignore, se conserva y
+# solo se le añaden estas líneas al final (nunca se sobrescribe).
+DOCKERIGNORE_ADDITIONS=$(cat <<'EOF'
+
+# --- Añadido automáticamente por el instalador universal ---
+# Evita que archivos propios del instalador (no de la aplicación) terminen
+# dentro de la imagen construida.
+.zip_extract/
+EOF
+)
+if [ -n "$EMBEDDED_ZIP_SOURCES" ]; then
+    while IFS= read -r zrel; do
+        [ -n "$zrel" ] && DOCKERIGNORE_ADDITIONS="${DOCKERIGNORE_ADDITIONS}"$'\n'"$zrel"
+    done <<< "$EMBEDDED_ZIP_SOURCES"
+fi
+# Excluir el propio instalador si quedó copiado junto al código fuente.
+for installer_name in iniciar.sh iniciar_universal_v6_corregido.sh install.sh deploy.sh; do
+    [ -f "$INSTANCE_SOURCE/$installer_name" ] && DOCKERIGNORE_ADDITIONS="${DOCKERIGNORE_ADDITIONS}"$'\n'"$installer_name"
+done
+printf '%s\n' "$DOCKERIGNORE_ADDITIONS" >> "$INSTANCE_SOURCE/.dockerignore"
+echo "✅ .dockerignore actualizado (excluye artefactos del instalador de la imagen)."
 
 # ------------------------------------------------------------------------------
 # 2.1 Preparar Docker sin modificar la configuración existente
@@ -1905,6 +1950,32 @@ docker compose \
     --project-directory "$INSTANCE_SOURCE" \
     -p "$COMPOSE_PROJECT_NAME" \
     up -d --build --remove-orphans
+
+# ------------------------------------------------------------------------------
+# 10.1 CORRECCIÓN UNIVERSAL DE PERMISOS (evita 403 Forbidden en cualquier stack)
+# ------------------------------------------------------------------------------
+# No se puede confiar en que el Dockerfile de CADA proyecto (distintos repos,
+# distintos autores, distintos ZIP de origen) haga chmod correctamente después
+# de copiar el código. La única forma verdaderamente universal de garantizar
+# que el servidor web pueda leer sus propios archivos es corregir los permisos
+# DENTRO del contenedor ya en ejecución, sin importar su imagen base ni su
+# Dockerfile. No requiere editar nada de cada proyecto ni reconstruir nada.
+echo "================================================="
+echo "🔐 5.1 Normalizando permisos dentro de los contenedores (evita 403 Forbidden)..."
+echo "================================================="
+COMMON_WEBROOTS="/var/www/html /var/www /usr/share/nginx/html /app /srv/www /home/site/wwwroot"
+RUNNING_CONTAINERS=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q 2>/dev/null || true)
+for cid in $RUNNING_CONTAINERS; do
+    cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')
+    for webroot in $COMMON_WEBROOTS; do
+        # a+rX: añade lectura a todos y ejecución/traspaso SOLO a directorios
+        # (o archivos que ya eran ejecutables). Nunca quita permisos
+        # existentes, así que es seguro sin importar qué usuario use el
+        # proceso del contenedor (www-data, node, app, root, etc.).
+        docker exec "$cid" sh -c "[ -d '$webroot' ] && chmod -R a+rX '$webroot' 2>/dev/null" >/dev/null 2>&1 && \
+            echo "   ✅ Permisos normalizados en $cname:$webroot" || true
+    done
+done
 
 # ------------------------------------------------------------------------------
 # 11. Esperar BD
