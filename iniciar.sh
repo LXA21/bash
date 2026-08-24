@@ -1,6 +1,6 @@
-!/bin/bash
+#!/bin/bash
 set -Eeuo pipefail
-
+ 
 # ============================================================================== 
 # INSTALADOR UNIVERSAL DEFINITIVO
 # Docker / Docker Compose / MySQL / MariaDB / PostgreSQL
@@ -21,44 +21,44 @@ set -Eeuo pipefail
 #   Este script NO ejecuta `docker compose down -v`.
 #   Una nueva instancia NO reutiliza los datos de una instancia anterior.
 # ============================================================================== 
-
+ 
 set +e
 trap 'rc=$?; set -e; echo "❌ Error en la línea $LINENO. Código: $rc"; exit "$rc"' ERR
 set -e
-
+ 
 SUDO=""
 if [ "${EUID:-0}" -ne 0 ]; then SUDO="sudo"; fi
-
+ 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
-
+ 
 sanitize_name() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^-*//; s/-*$//'
 }
-
+ 
 sql_escape() {
     printf '%s' "$1" | sed "s/'/''/g"
 }
-
+ 
 prompt_yes_no() {
     local prompt="$1" default="${2:-N}" answer
     read -r -p "$prompt" answer
     answer=${answer:-$default}
     [[ "$answer" =~ ^[SsYy]$ ]]
 }
-
+ 
 # ------------------------------------------------------------------------------
 # 0. Docker y herramientas base
 # ------------------------------------------------------------------------------
 echo "================================================="
 echo "🐳 0. Verificando Docker, Compose y herramientas..."
 echo "================================================="
-
+ 
 if ! command_exists docker; then
     echo "⚙️ Docker no está instalado. Instalando Docker..."
     $SUDO apt-get update -y
     $SUDO apt-get install -y ca-certificates curl gnupg git unzip iproute2 python3 sudo
     $SUDO install -m 0755 -d /etc/apt/keyrings
-
+ 
     . /etc/os-release
     case "${ID:-}" in
         debian)
@@ -73,7 +73,7 @@ if ! command_exists docker; then
             exit 1
             ;;
     esac
-
+ 
     $SUDO install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "$DOCKER_REPO/gpg" | $SUDO gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
     $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
@@ -83,7 +83,7 @@ if ! command_exists docker; then
     $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     $SUDO systemctl enable --now docker
 fi
-
+ 
 for pkg in git unzip iproute2 python3; do
     if ! command_exists "$pkg"; then
         echo "⚙️ Instalando $pkg..."
@@ -91,33 +91,33 @@ for pkg in git unzip iproute2 python3; do
         $SUDO apt-get install -y "$pkg"
     fi
 done
-
+ 
 if ! docker compose version >/dev/null 2>&1; then
     echo "❌ Docker Compose v2 no está disponible."
     exit 1
 fi
-
+ 
 if ! docker info >/dev/null 2>&1; then
     echo "⚡ Iniciando Docker..."
     $SUDO systemctl enable --now docker 2>/dev/null || $SUDO service docker start
 fi
-
+ 
 echo "✅ Docker: $(docker --version)"
 echo "✅ Compose: $(docker compose version --short 2>/dev/null || docker compose version)"
-
+ 
 # ------------------------------------------------------------------------------
 # 0.1 Usuario administrativo
 # ------------------------------------------------------------------------------
 echo "================================================="
 echo "👤 0.1 Configuración del usuario administrativo"
 echo "================================================="
-
+ 
 SUDO_USER_NAME="${1:-}"
 if [ -z "$SUDO_USER_NAME" ]; then
     read -r -p "👉 Nombre del usuario sudo a crear/usar: " SUDO_USER_NAME
 fi
 [ -n "$SUDO_USER_NAME" ] || { echo "❌ Usuario vacío."; exit 1; }
-
+ 
 if ! id "$SUDO_USER_NAME" >/dev/null 2>&1; then
     while :; do
         read -r -s -p "👉 Contraseña para '$SUDO_USER_NAME' (obligatoria): " SUDO_USER_PASS
@@ -151,19 +151,19 @@ else
         printf '%s:%s\n' "$SUDO_USER_NAME" "$SUDO_USER_PASS" | $SUDO chpasswd
     fi
 fi
-
+ 
 for U in "${USER:-}" "$SUDO_USER_NAME"; do
     if [ -n "$U" ] && id "$U" >/dev/null 2>&1; then
         id -nG "$U" | grep -qw docker || $SUDO usermod -aG docker "$U" 2>/dev/null || true
     fi
 done
-
+ 
 # ------------------------------------------------------------------------------
 # 0.2 Escritorio y repositorio
 # ------------------------------------------------------------------------------
 USER_HOME=$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6 || true)
 USER_HOME=${USER_HOME:-$HOME}
-
+ 
 if [ -d "$USER_HOME/Desktop" ]; then
     ESCRITORIO="$USER_HOME/Desktop"
 elif [ -d "$USER_HOME/Escritorio" ]; then
@@ -173,48 +173,129 @@ else
     $SUDO mkdir -p "$ESCRITORIO"
     $SUDO chown "$SUDO_USER_NAME:$SUDO_USER_NAME" "$ESCRITORIO" 2>/dev/null || true
 fi
-
+ 
 read -r -p "👉 URL del repositorio Git: " REPO_URL
 [ -n "$REPO_URL" ] || { echo "❌ Debes indicar una URL Git."; exit 1; }
-
+ 
+# --------------------------------------------------------------------------
+# Público / privado + credenciales (nunca se imprimen, nunca se guardan
+# dentro del proyecto ni en el repo clonado). Se usan solo durante el clone
+# mediante GIT_ASKPASS, y se destruyen inmediatamente después.
+# --------------------------------------------------------------------------
+REPO_VISIBILITY=""
+REPO_AUTH_USER=""
+REPO_AUTH_TOKEN=""
+REPO_AUTH_REQUIRED=0
+ 
+while [ "$REPO_VISIBILITY" != "1" ] && [ "$REPO_VISIBILITY" != "2" ]; do
+    read -r -p "👉 ¿Repositorio público o privado? [1=Público / 2=Privado]: " REPO_VISIBILITY
+done
+ 
+if [ "$REPO_VISIBILITY" = "2" ]; then
+    REPO_AUTH_REQUIRED=1
+    read -r -p "👉 Usuario de acceso: " REPO_AUTH_USER
+    read -r -s -p "👉 Token/contraseña de acceso: " REPO_AUTH_TOKEN
+    echo ""
+    [ -n "$REPO_AUTH_TOKEN" ] || { echo "❌ Debes indicar un token/contraseña para un repositorio privado."; exit 1; }
+fi
+ 
+clone_repository_remote() {
+    # $1 = URL, $2 = destino. Siempre crea una instancia NUEVA: nunca reutiliza
+    # ni actualiza (pull/reset/checkout) una copia local existente.
+    local url="$1" dest="$2" askpass_file="" rc=0
+ 
+    if [ "$REPO_AUTH_REQUIRED" -eq 1 ]; then
+        askpass_file=$(mktemp)
+        chmod 700 "$askpass_file"
+        {
+            echo '#!/bin/sh'
+            echo 'case "$1" in'
+            echo '  *sername*) printf "%s" "$GIT_ASKPASS_USER" ;;'
+            echo '  *) printf "%s" "$GIT_ASKPASS_TOKEN" ;;'
+            echo 'esac'
+        } > "$askpass_file"
+        chmod 700 "$askpass_file"
+ 
+        set +e
+        GIT_ASKPASS="$askpass_file" GIT_ASKPASS_USER="$REPO_AUTH_USER" GIT_ASKPASS_TOKEN="$REPO_AUTH_TOKEN" \
+            GIT_TERMINAL_PROMPT=0 git clone "$url" "$dest"
+        rc=$?
+        set -e
+ 
+        # El archivo temporal de credenciales se borra siempre, en cada
+        # intento. El token en memoria (REPO_AUTH_TOKEN) NO se borra aquí:
+        # si el clone falla y el usuario elige "Reintentar", el reintento
+        # necesita seguir teniendo el token disponible. Se borra una única
+        # vez, después de un clone exitoso (ver bucle de llamada más abajo).
+        rm -f "$askpass_file"
+    else
+        set +e
+        GIT_TERMINAL_PROMPT=0 git clone "$url" "$dest"
+        rc=$?
+        set -e
+    fi
+ 
+    return "$rc"
+}
+ 
 REPO_BASENAME=$(basename "${REPO_URL%/}")
 REPO_BASENAME=${REPO_BASENAME%.git}
 DEFAULT_SYSTEM_NAME=$(sanitize_name "$REPO_BASENAME")
 DEFAULT_SYSTEM_NAME=${DEFAULT_SYSTEM_NAME:-sistema}
-
+ 
 read -r -p "👉 Nombre del sistema [$DEFAULT_SYSTEM_NAME]: " SYSTEM_NAME
 SYSTEM_NAME=${SYSTEM_NAME:-$DEFAULT_SYSTEM_NAME}
 SYSTEM_NAME=$(sanitize_name "$SYSTEM_NAME")
 [ -n "$SYSTEM_NAME" ] || { echo "❌ Nombre de sistema inválido."; exit 1; }
-
+ 
 REPO_DIR="$ESCRITORIO/$SYSTEM_NAME"
-
-if [ -e "$REPO_DIR" ] && [ ! -d "$REPO_DIR/.git" ]; then
-    echo "❌ Ya existe '$REPO_DIR' y no es un repositorio Git."
-    exit 1
+ 
+# Cada despliegue exige una descarga NUEVA. Si ya existe una carpeta con ese
+# nombre (de una ejecución anterior), nunca se reutiliza como origen: se pide
+# borrarla, renombrar el sistema o cancelar.
+if [ -e "$REPO_DIR" ]; then
+    echo "⚠️ Ya existe '$REPO_DIR' de un despliegue anterior."
+    echo "   El repositorio remoto debe descargarse siempre de nuevo; no se reutiliza código local."
+    read -r -p "👉 ¿Eliminar esa copia y volver a descargar? [s/N]: " RESP_REPO_EXISTS
+    case "${RESP_REPO_EXISTS,,}" in
+        s|si|sí|y|yes)
+            REPO_DIR_REAL=$(realpath -m "$REPO_DIR")
+            ESCRITORIO_REAL=$(realpath -m "$ESCRITORIO")
+            if [ "$REPO_DIR_REAL" = "/" ] || [ "$REPO_DIR_REAL" = "$USER_HOME" ] || \
+               [ "$REPO_DIR_REAL" = "$ESCRITORIO_REAL" ] || [ "${REPO_DIR_REAL#$ESCRITORIO_REAL/}" = "$REPO_DIR_REAL" ]; then
+                echo "❌ Ruta insegura para eliminar, abortando: $REPO_DIR_REAL"
+                exit 1
+            fi
+            rm -rf "$REPO_DIR_REAL"
+            ;;
+        *)
+            echo "❌ Cancelado. Elige otro nombre de sistema o elimina manualmente '$REPO_DIR'."
+            exit 1
+            ;;
+    esac
 fi
-
+ 
 # ------------------------------------------------------------------------------
 # 0.3 Descargar/clonar repositorio sin destruir una copia existente
 # ------------------------------------------------------------------------------
 echo "================================================="
 echo "📥 0.3 Obteniendo repositorio"
 echo "================================================="
-
+ 
 extract_repository_zip() {
     local zip_file="$1" dest="$2" extract_dir top_dir depth rc
-
+ 
     # Validación mínima: que el archivo descargado exista y no esté vacío
     # antes de intentar descomprimir (evita fallos confusos de unzip).
     if [ ! -s "$zip_file" ]; then
         echo "❌ El archivo ZIP descargado está vacío o no existe: $zip_file"
         exit 1
     fi
-
+ 
     extract_dir=$(mktemp -d)
-
+ 
     echo "📦 Extrayendo repositorio ZIP..."
-
+ 
     # CORRECCIÓN CRÍTICA: unzip devuelve código 1 para simples ADVERTENCIAS
     # (bytes extra al inicio del zip, CRC no crítico, etc.), no solo para
     # errores fatales (código >=2). Como el script es "universal" y debe
@@ -227,7 +308,7 @@ extract_repository_zip() {
     unzip -q -o "$zip_file" -d "$extract_dir"
     rc=$?
     set -e
-
+ 
     if [ "$rc" -ge 2 ] || [ -z "$(find "$extract_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
         rm -rf "$extract_dir"
         echo "❌ No se pudo extraer el ZIP del repositorio (código de salida de unzip: $rc)."
@@ -235,12 +316,12 @@ extract_repository_zip() {
     elif [ "$rc" -eq 1 ]; then
         echo "⚠️ unzip reportó advertencias no fatales (código 1) al extraer; se continúa porque el contenido sí se extrajo."
     fi
-
+ 
     # Eliminar basura típica de zips generados en macOS que rompe la
     # detección de "carpeta envolvente única" más abajo.
     find "$extract_dir" -maxdepth 2 -type d -name '__MACOSX' -exec rm -rf {} + 2>/dev/null || true
     find "$extract_dir" -maxdepth 2 -type f -name '.DS_Store' -delete 2>/dev/null || true
-
+ 
     # CORRECCIÓN: navegar recursivamente mientras el nivel actual sea
     # exactamente UNA carpeta envolvente sin archivos sueltos. Esto evita el
     # error de "el sistema quedó dentro de una carpeta" cuando el ZIP anida
@@ -255,13 +336,13 @@ extract_repository_zip() {
             break
         fi
     done
-
+ 
     if [ -z "$(find "$top_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
         rm -rf "$extract_dir"
         echo "❌ El ZIP se extrajo pero no contiene archivos utilizables."
         exit 1
     fi
-
+ 
     # Normalizar permisos aditivamente ANTES de copiar al destino final: los
     # ZIP preservan el modo original de cada entrada, que puede venir
     # restrictivo (000, sin +x en directorios) según la herramienta que
@@ -270,20 +351,20 @@ extract_repository_zip() {
     # archivos, incluso después de un chown correcto en el Dockerfile.
     find "$top_dir" -type d -exec chmod u+rwx,go+rx {} \; 2>/dev/null || true
     find "$top_dir" -type f -exec chmod u+rw,go+r {} \; 2>/dev/null || true
-
+ 
     mkdir -p "$dest"
     tar -C "$top_dir" -cf - . | tar -C "$dest" -xf -
     rm -rf "$extract_dir"
-
+ 
     if [ -z "$(find "$dest" -mindepth 1 -print -quit 2>/dev/null)" ]; then
         echo "❌ La copia final del repositorio quedó vacía en '$dest'."
         exit 1
     fi
     echo "✅ ZIP descomprimido correctamente en: $dest"
 }
-
+ 
 REPO_URL_NO_QUERY="${REPO_URL%%\?*}"
-
+ 
 # CORRECCIÓN: para que el script sea realmente "universal" no basta con mirar
 # si la URL termina en ".zip" — muchos paneles/plataformas sirven ZIPs desde
 # URLs sin esa extensión (p. ej. endpoints de exportación, enlaces firmados de
@@ -294,14 +375,14 @@ IS_ZIP_URL=0
 case "${REPO_URL_NO_QUERY,,}" in
     *.zip) IS_ZIP_URL=1 ;;
 esac
-
+ 
 if [ "$IS_ZIP_URL" -eq 0 ]; then
     HEADERS=$(curl -fsIL --retry 2 --connect-timeout 10 "$REPO_URL" 2>/dev/null || true)
     if printf '%s' "$HEADERS" | tr -d '\r' | grep -qiE '^(content-type: .*zip|content-disposition: .*\.zip)'; then
         IS_ZIP_URL=1
     fi
 fi
-
+ 
 case "$IS_ZIP_URL" in
     1)
         ZIP_TMP=$(mktemp --suffix=.zip)
@@ -330,42 +411,89 @@ case "$IS_ZIP_URL" in
         rm -f "$ZIP_TMP"
         ;;
     *)
-        if [ -d "$REPO_DIR/.git" ]; then
-            git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
-            if ! git -C "$REPO_DIR" pull --ff-only; then
-                echo "⚠️ No se pudo actualizar con pull --ff-only. Se conserva el código local."
-            fi
-        else
-            if [ -n "$SUDO" ]; then
-                $SUDO -u "$SUDO_USER_NAME" git clone "$REPO_URL" "$REPO_DIR"
+        # SIEMPRE una descarga nueva desde el remoto. Nunca se actualiza
+        # (pull/reset/checkout) una copia local existente ni se usa una
+        # instancia P# anterior como origen.
+        CLONE_ATTEMPT_OK=0
+        while [ "$CLONE_ATTEMPT_OK" -eq 0 ]; do
+            if clone_repository_remote "$REPO_URL" "$REPO_DIR"; then
+                CLONE_ATTEMPT_OK=1
+                # Clone exitoso: ya no se necesita el token en memoria.
+                unset REPO_AUTH_TOKEN
+                REPO_AUTH_TOKEN=""
             else
-                git clone "$REPO_URL" "$REPO_DIR"
+                echo "❌ Falló la descarga del repositorio."
+                echo "   URL: $REPO_URL"
+                echo "   Destino: $REPO_DIR"
+                echo "1) Reintentar"
+                echo "2) Eliminar los archivos descargados"
+                echo "3) Conservarlos para diagnóstico y salir"
+                echo "4) Cancelar"
+                read -r -p "👉 Opción: " CLONE_FAIL_OPT
+                case "$CLONE_FAIL_OPT" in
+                    1)
+                        [ -n "$REPO_DIR" ] && [ "$REPO_DIR" != "/" ] && [ -e "$REPO_DIR" ] && rm -rf "$REPO_DIR"
+                        ;;
+                    2)
+                        [ -n "$REPO_DIR" ] && [ "$REPO_DIR" != "/" ] && rm -rf "$REPO_DIR"
+                        exit 1
+                        ;;
+                    3) exit 1 ;;
+                    *) exit 1 ;;
+                esac
             fi
-        fi
+        done
         ;;
 esac
-
+ 
 $SUDO chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$REPO_DIR" 2>/dev/null || true
-
+ 
 # Ruta INMUTABLE del repositorio original. Nunca debe confundirse con Pn/source.
 ORIGINAL_REPO_DIR="$REPO_DIR"
 REPO_DIR_ORIGINAL="$ORIGINAL_REPO_DIR"
-
+ 
 echo "✅ Código fuente: $REPO_DIR"
-
+ 
 # ------------------------------------------------------------------------------
 # 1. Detectar y entender la configuración Docker existente
 # ------------------------------------------------------------------------------
 COMPOSE_FILE=""
-for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+COMPOSE_FILES=()
+# Prioridad de archivo base igual a la de Docker Compose nativo.
+for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
     if [ -f "$REPO_DIR/$f" ]; then
         COMPOSE_FILE="$REPO_DIR/$f"
+        COMPOSE_FILES+=("$COMPOSE_FILE")
         break
     fi
 done
-
+ 
+# Si existe, se añade automáticamente el override correspondiente: es el
+# mismo comportamiento por defecto de `docker compose` (no es una decisión
+# arbitraria del script, sino la semántica estándar de Compose).
+if [ -n "$COMPOSE_FILE" ]; then
+    for ov in compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml; do
+        if [ -f "$REPO_DIR/$ov" ]; then
+            COMPOSE_FILES+=("$REPO_DIR/$ov")
+            break
+        fi
+    done
+fi
+ 
+# Construye los argumentos -f repetidos para todas las llamadas a
+# `docker compose`. Se recalcula más abajo una vez resuelto el Compose de
+# instancia (INSTANCE_COMPOSE_FILE); ver bloque de instancia.
+build_compose_f_args() {
+    COMPOSE_F_ARGS=()
+    local f
+    for f in "${COMPOSE_FILES[@]}"; do
+        COMPOSE_F_ARGS+=(-f "$f")
+    done
+}
+build_compose_f_args
+ 
 cd "$REPO_DIR"
-
+ 
 # ------------------------------------------------------------------------------
 # Resolver TODOS los build.context + build.dockerfile declarados por Compose.
 # IMPORTANTE: esta función debe ejecutarse ANTES de consultar BUILD_TARGETS.
@@ -375,7 +503,7 @@ resolve_compose_build_targets() {
     [ -n "$COMPOSE_FILE" ] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     local json_file="$REPO_DIR/.compose-resolved.json"
-    if ! docker compose -f "$COMPOSE_FILE" --project-directory "$REPO_DIR" config --format json > "$json_file" 2>/dev/null; then
+    if ! docker compose "${COMPOSE_F_ARGS[@]}" --project-directory "$REPO_DIR" config --format json > "$json_file" 2>/dev/null; then
         rm -f "$json_file"
         return 0
     fi
@@ -399,33 +527,77 @@ PYJSON
     rm -f "$json_file"
 }
 resolve_compose_build_targets
-
-# Resolver el Dockerfile principal después de haber obtenido BUILD_TARGETS.
-# Si Compose declara múltiples builds, se conserva el primer Dockerfile válido
-# encontrado para el análisis general; cada servicio se procesa posteriormente
-# mediante BUILD_TARGETS.
+ 
+# ------------------------------------------------------------------------------
+# Resolver image: de cada servicio desde Compose.
+# ------------------------------------------------------------------------------
+ 
+resolve_compose_service_images() {
+    [ -n "$COMPOSE_FILE" ] || return 0
+ 
+    local json_file="$REPO_DIR/.compose-services.json"
+ 
+    if ! docker compose \
+        "${COMPOSE_F_ARGS[@]}" \
+        --project-directory "$REPO_DIR" \
+        config --format json > "$json_file" 2>/dev/null
+    then
+        rm -f "$json_file"
+        echo "⚠️ No se pudo resolver Compose en formato JSON."
+        return 0
+    fi
+ 
+    while IFS=$'\t' read -r svc image; do
+        [ -n "$svc" ] || continue
+        SERVICE_IMAGE["$svc"]="$image"
+    done < <(
+        python3 - "$json_file" <<'PY'
+import json
+import sys
+ 
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+ 
+for service, config in (data.get("services") or {}).items():
+    print(f"{service}\t{config.get('image') or ''}")
+PY
+    )
+ 
+    rm -f "$json_file"
+}
+ 
+resolve_compose_service_images
+# ------------------------------------------------------------------------------
+# MODELO UNIVERSAL DE BUILDS POR SERVICIO
+# ------------------------------------------------------------------------------
+ 
+declare -A SERVICE_HAS_BUILD
+declare -A SERVICE_BUILD_CONTEXT
+declare -A SERVICE_DOCKERFILE
+declare -A SERVICE_IMAGE
+ 
 DOCKERFILE_PATH=""
+ 
 if [ -n "$BUILD_TARGETS" ]; then
     while IFS=$'\t' read -r svc ctx df eff; do
-        [ -n "$eff" ] || continue
-        if [ -f "$eff" ] && [ -z "$DOCKERFILE_PATH" ]; then
+        [ -n "$svc" ] || continue
+ 
+        SERVICE_HAS_BUILD["$svc"]="1"
+        SERVICE_BUILD_CONTEXT["$svc"]="$ctx"
+        SERVICE_DOCKERFILE["$svc"]="$eff"
+ 
+        # Compatibilidad con código antiguo.
+        # NO se utilizará para decidir el Dockerfile de cada servicio.
+        if [ -z "$DOCKERFILE_PATH" ] && [ -f "$eff" ]; then
             DOCKERFILE_PATH="$eff"
         fi
     done <<< "$BUILD_TARGETS"
 fi
-if [ -z "$DOCKERFILE_PATH" ]; then
-    for f in Dockerfile dockerfile; do
-        if [ -f "$REPO_DIR/$f" ]; then
-            DOCKERFILE_PATH="$REPO_DIR/$f"
-            break
-        fi
-    done
-fi
-
+ 
 echo "================================================="
 echo "🔎 1. Analizando proyecto y configuración Docker"
 echo "================================================="
-
+ 
 if [ -n "$COMPOSE_FILE" ]; then
     echo "✅ Compose existente: $(basename "$COMPOSE_FILE")"
 else
@@ -436,14 +608,14 @@ if [ -n "$DOCKERFILE_PATH" ]; then
 else
     echo "⚠️ No existe Dockerfile en el repositorio."
 fi
-
+ 
 # Analizar el Dockerfile existente sin modificarlo.
 if [ -n "$DOCKERFILE_PATH" ]; then
     echo "🔍 Directivas Docker detectadas:"
     grep -E '^[[:space:]]*(FROM|ARG|ENV|WORKDIR|COPY|ADD|RUN|EXPOSE|USER|CMD|ENTRYPOINT)[[:space:]]' "$DOCKERFILE_PATH" \
         | sed 's/^/   • /' || true
 fi
-
+ 
 # Detectores básicos de tecnología para poder generar Docker cuando falte.
 detect_project_type() {
     if [ -f package.json ]; then echo node; return; fi
@@ -453,10 +625,14 @@ detect_project_type() {
     if find . -maxdepth 2 -type f -name 'index.html' -print -quit | grep -q .; then echo static; return; fi
     echo unknown
 }
-
+GENERATED_DOCKERFILES=""
+GENERATED_PHP_WEB_MODE=""
+DOCKERFILE_WAS_GENERATED="0"
+ 
 PROJECT_TYPE=$(detect_project_type)
 echo "🧩 Tecnología detectada: $PROJECT_TYPE"
-
+ 
+ 
 # Detectar tecnología de un servicio concreto cuando Compose tiene múltiples builds.
 # La prioridad es: archivos del contexto -> nombre del servicio/contexto -> raíz del proyecto.
 detect_service_type() {
@@ -480,7 +656,7 @@ detect_service_type() {
     esac
     echo "$PROJECT_TYPE"
 }
-
+ 
 # Determinar el servidor web cuando hay que GENERAR Docker y no existe Compose.
 # Si la evidencia es contradictoria, no inventamos una arquitectura.
 detect_local_web_stack() {
@@ -496,7 +672,7 @@ detect_local_web_stack() {
     elif [ "$a" -eq 1 ]; then echo apache;
     else echo unknown; fi
 }
-
+ 
 # Añadir permisos SOLO para directorios que existen en el contexto real.
 # La comprobación [ -d ] también protege el build si .dockerignore excluye alguno.
 append_php_runtime_permissions() {
@@ -512,7 +688,7 @@ RUN set -eux; for d in $paths; do if [ -d "\$d" ]; then chown -R www-data:www-da
 EOF
     fi
 }
-
+ 
 # Detectar un puerto ya declarado por el proyecto antes de inventar uno.
 detect_app_port() {
     local p=""
@@ -525,12 +701,12 @@ detect_app_port() {
     echo "${p:-}"
 }
 APP_PORT_DETECTED=$(detect_app_port)
-
+ 
 # Genera solamente el Dockerfile que falte. El Compose se genera más adelante,
 # después de copiar la instancia, para que sus rutas sean las definitivas.
 generate_dockerfile_if_missing() {
     [ -n "$DOCKERFILE_PATH" ] && return 0
-
+ 
     # Si Compose ya existe, NO generamos un Dockerfile genérico en la raíz.
     # Los Dockerfiles requeridos por cada servicio se resuelven después, respetando
     # exactamente build.context + build.dockerfile. Si Compose solo usa imágenes,
@@ -539,7 +715,7 @@ generate_dockerfile_if_missing() {
         echo "ℹ️ Compose existente: la generación de Dockerfiles se hará por servicio solo si algún build los requiere."
         return 0
     fi
-
+ 
     echo "🛠️ No existe Dockerfile ni Compose. Se generará un Dockerfile a partir de la estructura detectada."
     case "$PROJECT_TYPE" in
         node)
@@ -573,8 +749,8 @@ EOF
             # Laravel/Symfony/u otro framework que no existan en el proyecto.
             php_web_mode=""
             if [ -n "$COMPOSE_FILE" ]; then
-                if grep -Eqi 'nginx|openresty|php-fpm|fpm' "$COMPOSE_FILE"; then php_web_mode="fpm";
-                elif grep -Eqi 'apache|httpd' "$COMPOSE_FILE"; then php_web_mode="apache"; fi
+                if grep -Eqi 'nginx|openresty|php-fpm|fpm' "${COMPOSE_FILES[@]}" 2>/dev/null; then php_web_mode="fpm";
+                elif grep -Eqi 'apache|httpd' "${COMPOSE_FILES[@]}" 2>/dev/null; then php_web_mode="apache"; fi
             else
                 local_web_stack=$(detect_local_web_stack "$REPO_DIR")
                 case "$local_web_stack" in
@@ -675,14 +851,12 @@ EOF
     esac
     echo "✅ Dockerfile generado: ${DOCKERFILE_PATH#$REPO_DIR/}"
 }
-
-GENERATED_PHP_WEB_MODE=""
-DOCKERFILE_WAS_GENERATED="0"
+ 
 generate_dockerfile_if_missing
-
+ 
 # Genera solamente los archivos Docker que realmente faltan. Los existentes se respetan.
 # Dockerfile generation is performed before the instance is copied.
-
+ 
 # ------------------------------------------------------------------------------
 # 2. Seleccionar instancia Pn sin tocar las anteriores
 # ------------------------------------------------------------------------------
@@ -697,15 +871,15 @@ while :; do
     fi
     CONTADOR=$((CONTADOR + 1))
 done
-
+ 
 NOMBRE_CARPETA="P${CONTADOR}"
 COMPOSE_PROJECT_NAME="$PROJECT_CANDIDATE"
 mkdir -p "$CARPETA_DESTINO"
-
+ 
 INSTANCE_SOURCE="$CARPETA_DESTINO/source"
 INSTANCE_ENV="$CARPETA_DESTINO/.env"
 MANIFEST="$CARPETA_DESTINO/deployment.env"
-
+ 
 if [ -f "$REPO_DIR/.env" ]; then
     cp "$REPO_DIR/.env" "$INSTANCE_ENV"
 else
@@ -713,10 +887,10 @@ else
 fi
 printf '\nCOMPOSE_PROJECT_NAME=%s\nPREFIX_CONTENEDOR=%s\nPROJECT_NAME=%s\nPROJECT_SOURCE=%s\n' \
     "$COMPOSE_PROJECT_NAME" "$COMPOSE_PROJECT_NAME" "$SYSTEM_NAME" "$CARPETA_DESTINO/source" >> "$INSTANCE_ENV"
-
+ 
 mkdir -p "$INSTANCE_SOURCE"
 tar -C "$REPO_DIR" --exclude='./.git' -cf - . | tar -C "$INSTANCE_SOURCE" -xf -
-
+ 
 # CORRECCIÓN CRÍTICA (permisos "403 Forbidden" en el contenedor web):
 # COPY en un Dockerfile preserva LITERALMENTE los permisos que traían los
 # archivos en el ZIP o repositorio original. Como este instalador es
@@ -734,28 +908,33 @@ tar -C "$REPO_DIR" --exclude='./.git' -cf - . | tar -C "$INSTANCE_SOURCE" -xf -
 echo "🔐 Normalizando permisos de la fuente copiada (evita 403 Forbidden por permisos heredados del ZIP/repo)..."
 find "$INSTANCE_SOURCE" -type d -exec chmod u+rwx,go+rx {} \; 2>/dev/null || true
 find "$INSTANCE_SOURCE" -type f -exec chmod u+rw,go+r {} \; 2>/dev/null || true
-
-# Mantener exactamente el Compose que venía en el repositorio, pero apuntando
-# a la copia de la instancia. Nunca sustituirlo por compose.generated.yml.
+ 
+# Mantener exactamente el/los Compose que venían en el repositorio (base +
+# override si existía), pero apuntando a la copia de la instancia. Nunca
+# sustituirlos por compose.generated.yml.
 INSTANCE_COMPOSE_FILE=""
+INSTANCE_COMPOSE_FILES=()
 if [ -n "$COMPOSE_FILE" ]; then
-    compose_rel="${COMPOSE_FILE#$REPO_DIR/}"
-    if [ "$compose_rel" = "$COMPOSE_FILE" ]; then
-        echo "❌ El Compose detectado no pertenece al repositorio: $COMPOSE_FILE"
-        exit 1
-    fi
-    if [ -f "$INSTANCE_SOURCE/$compose_rel" ]; then
-        INSTANCE_COMPOSE_FILE="$INSTANCE_SOURCE/$compose_rel"
-    else
-        echo "❌ El Compose detectado no apareció en la copia de la instancia: $compose_rel"
-        exit 1
-    fi
+    for cf in "${COMPOSE_FILES[@]}"; do
+        compose_rel="${cf#$REPO_DIR/}"
+        if [ "$compose_rel" = "$cf" ]; then
+            echo "❌ El Compose detectado no pertenece al repositorio: $cf"
+            exit 1
+        fi
+        if [ -f "$INSTANCE_SOURCE/$compose_rel" ]; then
+            INSTANCE_COMPOSE_FILES+=("$INSTANCE_SOURCE/$compose_rel")
+        else
+            echo "❌ El Compose detectado no apareció en la copia de la instancia: $compose_rel"
+            exit 1
+        fi
+    done
+    INSTANCE_COMPOSE_FILE="${INSTANCE_COMPOSE_FILES[0]}"
 fi
-
+ 
 extract_embedded_zips() {
     local pass zip_file key out_dir found
     declare -A ZIP_DONE=()
-
+ 
     for pass in 1 2 3 4 5; do
         found=0
         while IFS= read -r -d '' zip_file; do
@@ -763,7 +942,7 @@ extract_embedded_zips() {
             [ -n "${ZIP_DONE[$key]:-}" ] && continue
             ZIP_DONE[$key]=1
             found=1
-
+ 
             out_dir="$INSTANCE_SOURCE/.zip_extract/$key"
             mkdir -p "$out_dir"
             echo "📦 Extrayendo paquete interno: ${zip_file#$INSTANCE_SOURCE/}"
@@ -771,7 +950,7 @@ extract_embedded_zips() {
                 echo "❌ No se pudo extraer: ${zip_file#$INSTANCE_SOURCE/}"
                 return 1
             fi
-
+ 
             # CORRECCIÓN: igual que con el ZIP del repositorio, navegar dentro
             # de carpetas envolventes anidadas para que el contenido real
             # (Dockerfile, compose, .sql, etc.) quede accesible y no atrapado
@@ -794,7 +973,7 @@ extract_embedded_zips() {
                 tar -C "$flat_tmp" -cf - . | tar -C "$out_dir" -xf -
                 rm -rf "$flat_tmp"
             fi
-
+ 
             # CORRECCIÓN CRÍTICA: dejar el contenido solo en .zip_extract/<hash>/
             # no sirve de nada si el Dockerfile del proyecto hace "COPY . ..."
             # desde la raíz de la instancia — el código real (index.php, etc.)
@@ -806,21 +985,21 @@ extract_embedded_zips() {
             # etc.) lo vaya a encontrar, sin importar la estructura del proyecto.
             echo "   ↳ Integrando contenido del paquete a la raíz de la instancia..."
             tar -C "$out_dir" -cf - . | tar -C "$INSTANCE_SOURCE" -k -xf - 2>/dev/null || true
-
+ 
             # El .zip original ya fue extraído e integrado: no debe terminar
             # dentro de la imagen de Docker (no aporta nada al contenedor y
             # puede confundirse con contenido real). Se marca para exclusión
             # vía .dockerignore más abajo; aquí solo se registra la ruta.
             EMBEDDED_ZIP_SOURCES="${EMBEDDED_ZIP_SOURCES}${zip_file#$INSTANCE_SOURCE/}"$'\n'
         done < <(find "$INSTANCE_SOURCE" -type f -iname '*.zip' ! -path '*/.git/*' ! -path '*/.zip_extract/*' -print0)
-
+ 
         [ "$found" -eq 0 ] && break
     done
 }
-
+ 
 EMBEDDED_ZIP_SOURCES=""
 extract_embedded_zips
-
+ 
 # ------------------------------------------------------------------------------
 # 2.0 .dockerignore universal: evita que archivos del INSTALADOR (no de la
 # app) terminen dentro de la imagen, sin importar el Dockerfile del proyecto.
@@ -828,7 +1007,7 @@ extract_embedded_zips
 # Esto es aditivo: si el repo ya trae su propio .dockerignore, se conserva y
 # solo se le añaden estas líneas al final (nunca se sobrescribe).
 DOCKERIGNORE_ADDITIONS=$(cat <<'EOF'
-
+ 
 # --- Añadido automáticamente por el instalador universal ---
 # Evita que archivos propios del instalador (no de la aplicación) terminen
 # dentro de la imagen construida.
@@ -846,18 +1025,67 @@ for installer_name in iniciar.sh iniciar_universal_v6_corregido.sh install.sh de
 done
 printf '%s\n' "$DOCKERIGNORE_ADDITIONS" >> "$INSTANCE_SOURCE/.dockerignore"
 echo "✅ .dockerignore actualizado (excluye artefactos del instalador de la imagen)."
-
+ 
+# ------------------------------------------------------------------------------
+# Detectar la imagen base REAL del Dockerfile de un servicio.
+# ------------------------------------------------------------------------------
+ 
+detect_dockerfile_base_image() {
+    local dockerfile="$1"
+ 
+    [ -f "$dockerfile" ] || return 0
+ 
+    awk '
+        /^[[:space:]]*FROM[[:space:]]+/ {
+            line=$0
+            sub(/^[[:space:]]*FROM[[:space:]]+/, "", line)
+            sub(/[[:space:]]+[Aa][Ss][[:space:]].*$/, "", line)
+            print line
+            exit
+        }
+    ' "$dockerfile"
+}
+ 
+# ------------------------------------------------------------------------------
+# Clasificar la imagen base.
+# ------------------------------------------------------------------------------
+ 
+classify_base_image() {
+    local base="$1"
+    local lower
+ 
+    lower=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+ 
+    case "$lower" in
+        php:*|php)                         echo "php" ;;
+        node:*|node)                       echo "node" ;;
+        python:*|python)                   echo "python" ;;
+        mariadb:*|mariadb)                 echo "mariadb" ;;
+        mysql:*|mysql)                     echo "mysql" ;;
+        postgres:*|postgres)               echo "postgres" ;;
+        redis:*|redis)                     echo "redis" ;;
+        nginx:*|nginx)                     echo "nginx" ;;
+        httpd:*|httpd)                     echo "apache" ;;
+        phpmyadmin:*|phpmyadmin)           echo "phpmyadmin" ;;
+        adminer:*|adminer)                 echo "adminer" ;;
+        rabbitmq:*|rabbitmq)               echo "rabbitmq" ;;
+        memcached:*|memcached)             echo "memcached" ;;
+        eclipse-temurin:*|openjdk:*|amazoncorretto:*|maven:*|gradle:*)
+                                            echo "java" ;;
+        *)                                  echo "unknown" ;;
+    esac
+}
+ 
 # ------------------------------------------------------------------------------
 # 2.1 Preparar Docker sin modificar la configuración existente
 # ------------------------------------------------------------------------------
 echo "================================================="
 echo "🐳 2.1 Preparando configuración Docker de la instancia"
 echo "================================================="
-
+ 
 # La copia de la instancia debe contener exactamente la configuración que se va a desplegar.
 # Si el proyecto ya tiene Dockerfile/Compose, se leen y se conservan.
 INSTANCE_DOCKERFILE_PATH=""
-GENERATED_DOCKERFILES=""
 # Respetar exactamente cada build.context + build.dockerfile del Compose.
 if [ -n "$BUILD_TARGETS" ]; then
     while IFS=$'\t' read -r svc ctx df eff; do
@@ -872,7 +1100,22 @@ if [ -n "$BUILD_TARGETS" ]; then
                     echo "⚠️ $svc requiere Dockerfile: $rel"
                     target="$INSTANCE_SOURCE/$rel"
                     mkdir -p "$(dirname "$target")"
-                    service_type=$(detect_service_type "$svc" "$ctx")
+                    service_type=""
+ 
+if [ -f "$eff" ]; then
+    base_image=$(detect_dockerfile_base_image "$eff")
+    service_type=$(classify_base_image "$base_image")
+fi
+ 
+if [ -z "$service_type" ] || [ "$service_type" = "unknown" ]; then
+    service_type=$(detect_service_type "$svc" "$ctx")
+fi
+ 
+echo "   🔧 Servicio: $svc"
+echo "      Contexto : $ctx"
+echo "      Dockerfile: $eff"
+echo "      Base     : ${base_image:-desconocida}"
+echo "      Tipo     : $service_type"   
                     echo "   🧩 Tecnología para '$svc': $service_type"
                     case "$service_type" in
                         node)
@@ -901,9 +1144,9 @@ EOF
                             # Las rutas de permisos se calculan desde el contexto real
                             # y, aun así, se protegen con [ -d ] durante el build.
                             php_web_mode=""
-                            if grep -Eqi 'nginx|openresty|php-fpm|fpm' "$COMPOSE_FILE" 2>/dev/null || [[ "$svc" =~ nginx|fpm ]]; then
+                            if grep -Eqi 'nginx|openresty|php-fpm|fpm' "${COMPOSE_FILES[@]}" 2>/dev/null || [[ "$svc" =~ nginx|fpm ]]; then
                                 php_web_mode="fpm"
-                            elif grep -Eqi 'apache|httpd' "$COMPOSE_FILE" 2>/dev/null || [[ "$svc" =~ apache|httpd ]]; then
+                            elif grep -Eqi 'apache|httpd' "${COMPOSE_FILES[@]}" 2>/dev/null || [[ "$svc" =~ apache|httpd ]]; then
                                 php_web_mode="apache"
                             else
                                 local_web_stack=$(detect_local_web_stack "$ctx")
@@ -1054,11 +1297,11 @@ else
         INSTANCE_DOCKERFILE_PATH="$INSTANCE_SOURCE/$rel"
     fi
 fi
-
+ 
 # Detectar Apache/Nginx sin sustituir la arquitectura existente.
 detect_web_stack() {
     local text=""
-    [ -n "$COMPOSE_FILE" ] && text=$(cat "$COMPOSE_FILE" 2>/dev/null || true)
+    [ -n "$COMPOSE_FILE" ] && text=$(cat "${COMPOSE_FILES[@]}" 2>/dev/null || true)
     text="$text\n$(find "$INSTANCE_SOURCE" -maxdepth 5 -type f \( -name 'Dockerfile*' -o -name 'nginx.conf' -o -name 'httpd.conf' -o -name '*.conf' \) -print0 2>/dev/null | xargs -0 cat 2>/dev/null || true)"
     local n a
     n=$(printf '%s' "$text" | grep -Eic '(^|[^a-z])(nginx|openresty)([^a-z]|$)|nginx:' || true)
@@ -1070,7 +1313,7 @@ detect_web_stack() {
 }
 WEB_STACK=$(detect_web_stack)
 echo "🌐 Arquitectura web detectada: $WEB_STACK"
-
+ 
 INSTANCE_COMPOSE_FILE="${INSTANCE_COMPOSE_FILE:-}"
 if [ -z "$INSTANCE_COMPOSE_FILE" ]; then
     # Si generamos PHP-FPM sin Compose, no es seguro inventar una topología HTTP: PHP-FPM
@@ -1106,14 +1349,17 @@ services:
     restart: unless-stopped
 EOF
     INSTANCE_COMPOSE_FILE="$INSTANCE_SOURCE/compose.generated.yml"
+    INSTANCE_COMPOSE_FILES=("$INSTANCE_COMPOSE_FILE")
     echo "✅ Compose generado para la instancia."
 fi
-
-# 🔴 Propagar el Compose de la instancia a partir de aquí: todo el resto del
-# script (build, up, ps, logs, etc.) debe operar sobre la copia aislada
+ 
+# 🔴 Propagar el/los Compose de la instancia a partir de aquí: todo el resto
+# del script (build, up, ps, logs, etc.) debe operar sobre la copia aislada
 # Pn/source, nunca sobre el repositorio original clonado.
 COMPOSE_FILE="$INSTANCE_COMPOSE_FILE"
-
+COMPOSE_FILES=("${INSTANCE_COMPOSE_FILES[@]}")
+build_compose_f_args
+ 
 # ------------------------------------------------------------------------------
 # Validación preventiva de Dockerfiles
 # ------------------------------------------------------------------------------
@@ -1145,7 +1391,7 @@ validate_generated_dockerfile_copy_sources() {
     done < <(grep -E '^[[:space:]]*(COPY|ADD)[[:space:]]+' "$dockerfile" || true)
     return 0
 }
-
+ 
 # Verifica RUN chown/chmod sobre rutas absolutas del DOCUMENTO existente.
 # No modifica el archivo: solo evita llegar al build con un fallo determinista.
 validate_existing_dockerfile_runtime_paths() {
@@ -1159,7 +1405,7 @@ validate_existing_dockerfile_runtime_paths() {
         esac
         path="$INSTANCE_SOURCE/$rel"
         [ -f "$path" ] || continue
-
+ 
         # Este chequeo SOLO aplica a Dockerfiles que ya existían en el repositorio.
         if [ -f "$REPO_DIR_ORIGINAL/$rel" ]; then
             while IFS= read -r candidate; do
@@ -1184,7 +1430,7 @@ validate_existing_dockerfile_runtime_paths() {
     done <<< "$BUILD_TARGETS"
     return 0
 }
-
+ 
 validate_generated_dockerfiles() {
     local svc ctx df eff rel path
     local any_generated=0
@@ -1197,14 +1443,14 @@ validate_generated_dockerfiles() {
             esac
             path="$INSTANCE_SOURCE/$rel"
             [ -f "$path" ] || { echo "❌ Falta el Dockerfile de '$svc': $rel"; return 1; }
-
+ 
             # La existencia en el repositorio ORIGINAL es la única fuente de verdad
             # para decidir si el Dockerfile era del proyecto.
             if [ -f "$REPO_DIR_ORIGINAL/$rel" ]; then
                 echo "ℹ️ '$rel' es Dockerfile ORIGINAL del proyecto: se respeta sin modificar y no se aplican reglas del generador."
                 continue
             fi
-
+ 
             any_generated=1
             if grep -qE 'chown -R www-data:www-data /var/www/html/(storage|api/events)' "$path"; then
                 echo "❌ El generador produjo una instrucción de permisos estática en '$rel'."
@@ -1232,31 +1478,31 @@ validate_generated_dockerfiles() {
     [ "$any_generated" -eq 0 ] && echo "ℹ️ No hay Dockerfiles generados por el instalador que requieran validación adicional."
     return 0
 }
-
+ 
 validate_generated_dockerfiles
 validate_existing_dockerfile_runtime_paths
-
-if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" config >/dev/null; then
+ 
+if ! docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" config >/dev/null; then
     echo "❌ El Compose existente/generado no pudo ser resuelto por Docker Compose."
     echo "   No se realizará ningún despliegue."
     exit 1
 fi
-
-COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" config)
-mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" config --services)
+ 
+COMPOSE_CONFIG=$(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" config)
+mapfile -t SERVICES < <(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" config --services)
 [ "${#SERVICES[@]}" -gt 0 ] || { echo "❌ Compose no contiene servicios."; exit 1; }
-
+ 
 echo "✅ Compose válido. Servicios detectados:"
 printf '   • %s\n' "${SERVICES[@]}"
-
-
+ 
+ 
 [ -f "$REPO_DIR/.env.example" ] && cp "$REPO_DIR/.env.example" "$CARPETA_DESTINO/.env.example" || true
-
+ 
 # Compatibilidad con el resto del instalador: a partir de aquí se trabaja sobre la instancia.
 # ------------------------------------------------------------------------------
 # 3. Analizar servicio de BD e imagen exacta
 # ------------------------------------------------------------------------------
-
+ 
 DB_SERVICE=""
 DB_ENGINE=""
 DB_IMAGE=""
@@ -1266,7 +1512,7 @@ DB_PASSWORD_DETECTED=""
 DB_ADMIN_USER_DETECTED=""
 DB_ADMIN_PASSWORD_DETECTED=""
 ROOT_PASSWORD_DETECTED=""
-
+ 
 for preferred in mysql mariadb db database postgres postgresql; do
     for svc in "${SERVICES[@]}"; do
         if [ "$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')" = "$preferred" ]; then
@@ -1275,7 +1521,7 @@ for preferred in mysql mariadb db database postgres postgresql; do
         fi
     done
 done
-
+ 
 if [ -z "$DB_SERVICE" ]; then
     for svc in "${SERVICES[@]}"; do
         lower=$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')
@@ -1285,7 +1531,7 @@ if [ -z "$DB_SERVICE" ]; then
         fi
     done
 fi
-
+ 
 service_block() {
     local svc="$1"
     printf '%s\n' "$COMPOSE_CONFIG" | awk -v svc="$svc" '
@@ -1294,24 +1540,24 @@ service_block() {
         inside {print}
     '
 }
-
+ 
 if [ -n "$DB_SERVICE" ]; then
     SERVICE_BLOCK=$(service_block "$DB_SERVICE")
     DB_IMAGE=$(printf '%s\n' "$SERVICE_BLOCK" | awk '/^[[:space:]]+image:/ {sub(/^[^:]+:[[:space:]]*/, ""); print; exit}' | sed 's/^"//;s/"$//' || true)
-
+ 
     DB_NAME_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_DATABASE|MARIADB_DATABASE|POSTGRES_DB):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     DB_USER_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_USER|MARIADB_USER|POSTGRES_USER):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     DB_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_PASSWORD|MARIADB_PASSWORD|POSTGRES_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     ROOT_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+(MYSQL_ROOT_PASSWORD|MARIADB_ROOT_PASSWORD):' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     DB_ADMIN_USER_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+POSTGRES_USER:' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
     DB_ADMIN_PASSWORD_DETECTED=$(printf '%s\n' "$SERVICE_BLOCK" | grep -E '^[[:space:]]+POSTGRES_PASSWORD:' | head -n1 | sed -E 's/^[^:]+:[[:space:]]*//;s/^"//;s/"$//' || true)
-
+ 
     case "${DB_IMAGE,,}" in
         *mariadb*) DB_ENGINE="mariadb" ;;
         *mysql*) DB_ENGINE="mysql" ;;
         *postgres*) DB_ENGINE="postgres" ;;
     esac
-
+ 
     if [ -z "$DB_ENGINE" ]; then
         if printf '%s\n' "$SERVICE_BLOCK" | grep -qE 'MARIADB_(DATABASE|USER|PASSWORD|ROOT_PASSWORD)'; then
             DB_ENGINE="mariadb"
@@ -1339,7 +1585,7 @@ if [ -n "$DB_SERVICE" ]; then
         ROOT_PASSWORD_DETECTED="$DB_ADMIN_PASSWORD_DETECTED"
     fi
 fi
-
+ 
 # ------------------------------------------------------------------------------
 # 4. Elegir modo BD / SQL
 # ------------------------------------------------------------------------------
@@ -1350,7 +1596,7 @@ DB_APP_PASS=""
 GRANT_MODE="none"
 CREATE_DB_USER="2"
 SQL_FILE=""
-
+ 
 if [ -n "$DB_SERVICE" ]; then
     # Para PostgreSQL, buscar las credenciales de aplicación en los servicios que consumen la BD.
     # Nunca se reutiliza POSTGRES_USER como usuario de aplicación por defecto.
@@ -1376,14 +1622,14 @@ if [ -n "$DB_SERVICE" ]; then
     read -r -p "👉 Selección [1]: " DB_MODE
     DB_MODE=${DB_MODE:-1}
     [[ "$DB_MODE" =~ ^[123]$ ]] || { echo "❌ Selección inválida."; exit 1; }
-
+ 
     if [ -z "$DB_NAME" ]; then
         read -r -p "👉 Nombre de la base de datos: " DB_NAME
     else
         read -r -p "👉 Nombre de la base de datos [$DB_NAME]: " tmp
         DB_NAME=${tmp:-$DB_NAME}
     fi
-
+ 
     if [ "$DB_MODE" = "2" ]; then
         # CORRECCIÓN: la búsqueda debe hacerse sobre $INSTANCE_SOURCE, porque
         # es ahí (no en $REPO_DIR) donde los ZIP internos ya fueron
@@ -1392,7 +1638,7 @@ if [ -n "$DB_SERVICE" ]; then
         # dentro de un .zip del repositorio.
         echo "🔎 Buscando archivos SQL dentro del contenido ya descomprimido (incluidos paquetes ZIP internos)..."
         mapfile -t SQL_FILES < <(find "$INSTANCE_SOURCE" -type f \( -iname '*.sql' -o -iname '*.sql.gz' \) ! -path '*/.git/*' | sort)
-
+ 
         if [ "${#SQL_FILES[@]}" -eq 0 ]; then
             echo "⚠️ Se seleccionó importar SQL, pero no se encontró ningún archivo .sql/.sql.gz."
             echo "   La BD '$DB_NAME' se creará/usará normalmente y NO se realizará ninguna importación."
@@ -1409,7 +1655,7 @@ if [ -n "$DB_SERVICE" ]; then
                         ;;
                 esac
             done
-
+ 
             if [ -n "$PREFERRED_SQL" ]; then
                 SQL_FILE="$PREFERRED_SQL"
                 echo "📄 SQL inicial detectado: ${SQL_FILE#$INSTANCE_SOURCE/}"
@@ -1429,7 +1675,7 @@ if [ -n "$DB_SERVICE" ]; then
         fi
     fi
 fi
-
+ 
 if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
     echo "================================================="
     echo "👤 3. Usuario de base de datos"
@@ -1438,7 +1684,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
     echo "2) No crear usuario"
     read -r -p "👉 Selección [1]: " CREATE_DB_USER
     CREATE_DB_USER=${CREATE_DB_USER:-1}
-
+ 
     if [ "$CREATE_DB_USER" = "1" ]; then
         DB_APP_USER="$DB_USER_DETECTED"
         if [ -n "$DB_USER_DETECTED" ]; then
@@ -1451,7 +1697,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
         else
             USE_DETECTED_DB_CREDS=2
         fi
-
+ 
         if [ "$USE_DETECTED_DB_CREDS" = "1" ]; then
             DB_APP_USER="$DB_USER_DETECTED"
             DB_APP_PASS="$DB_PASSWORD_DETECTED"
@@ -1470,7 +1716,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
                 echo "✅ El usuario de BD se configurará sin contraseña."
             fi
         fi
-
+ 
         if [[ "$DB_ENGINE" == "mysql" || "$DB_ENGINE" == "mariadb" || "$DB_ENGINE" == "postgres" ]]; then
             echo "1) Todos los permisos solo sobre '$DB_NAME'"
             echo "2) Permisos básicos de aplicación"
@@ -1481,7 +1727,7 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ] && [ -n "$DB_ENGINE" ]; then
         fi
     fi
 fi
-
+ 
 # ------------------------------------------------------------------------------
 # 4.1 Preflight de credenciales BD antes de tocar Docker
 # ------------------------------------------------------------------------------
@@ -1514,7 +1760,7 @@ validate_db_credentials_plan() {
     return 0
 }
 validate_db_credentials_plan
-
+ 
 # ------------------------------------------------------------------------------
 # 5. Generar variables de instancia
 # ------------------------------------------------------------------------------
@@ -1523,7 +1769,7 @@ BASE_WEB=$((1080 + NUM_INSTANCIA * 2))
 BASE_PMA=$((8081 + NUM_INSTANCIA * 2))
 BASE_DB=$((3307 + NUM_INSTANCIA))
 BASE_SSL=$((8443 + NUM_INSTANCIA * 2))
-
+ 
 next_free_port() {
     local p="$1" step="$2"
     while ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\.)${p}$"; do
@@ -1531,12 +1777,12 @@ next_free_port() {
     done
     echo "$p"
 }
-
+ 
 PUERTO_WEB=$(next_free_port "$BASE_WEB" 2)
 PUERTO_PMA=$(next_free_port "$BASE_PMA" 2)
 PUERTO_DB=$(next_free_port "$BASE_DB" 1)
 PUERTO_SSL=$(next_free_port "$BASE_SSL" 2)
-
+ 
 python3 - "$INSTANCE_ENV" "$COMPOSE_PROJECT_NAME" "$SYSTEM_NAME" "$INSTANCE_SOURCE" "$PUERTO_WEB" "$PUERTO_PMA" "$PUERTO_DB" "$PUERTO_SSL" "$DB_NAME" "$DB_APP_USER" "$DB_APP_PASS" "$CREATE_DB_USER" <<'PY'
 import sys, os
 p=sys.argv[1]
@@ -1575,22 +1821,62 @@ for k,v in managed.items():
         out.append(f'{k}={v}')
 open(p,'w').write('\n'.join(out)+'\n')
 PY
-
+ 
 # ------------------------------------------------------------------------------
 # 6. Renderizar Compose para esta instancia y analizar aislamiento
 # ------------------------------------------------------------------------------
 render_compose() {
     docker compose \
         --env-file "$INSTANCE_ENV" \
-        -f "$COMPOSE_FILE" \
+        "${COMPOSE_F_ARGS[@]}" \
         --project-directory "$INSTANCE_SOURCE" \
         -p "$COMPOSE_PROJECT_NAME" \
         config --format json
 }
-
+ 
 RENDERED_JSON=$(render_compose)
-printf '%s\n' "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json"
-
+ 
+# Persistir en disco SOLO una versión saneada: `docker compose config` resuelve
+# todas las variables de entorno, así que el JSON crudo puede contener
+# contraseñas/tokens en texto plano. El JSON crudo se mantiene solo en memoria
+# ($RENDERED_JSON) para el análisis interno del propio script; a disco va
+# siempre la versión redactada.
+# Se escribe primero a un archivo temporal y se lee por argv/archivo (nunca
+# interpolado dentro del heredoc): el contenido del Compose viene del
+# repositorio remoto y no es de confianza; interpolarlo directamente en un
+# heredoc sin comillas permitiría inyección de comandos ($(), backticks).
+RENDERED_JSON_TMP=$(mktemp)
+printf '%s\n' "$RENDERED_JSON" > "$RENDERED_JSON_TMP"
+python3 - "$RENDERED_JSON_TMP" "$CARPETA_DESTINO/compose.rendered.json" <<'PYSAFE'
+import json, re, sys
+src, out = sys.argv[1], sys.argv[2]
+with open(src) as fh:
+    data = json.load(fh)
+SENSITIVE = re.compile(r'(PASSWORD|TOKEN|SECRET|_KEY|CREDENTIAL|PRIVATE_KEY)', re.IGNORECASE)
+ 
+def redact_env(env):
+    if isinstance(env, dict):
+        return {k: ("***REDACTED***" if SENSITIVE.search(k) else v) for k, v in env.items()}
+    if isinstance(env, list):
+        result = []
+        for item in env:
+            if isinstance(item, str) and "=" in item:
+                k, _, v = item.partition("=")
+                result.append(f"{k}=***REDACTED***" if SENSITIVE.search(k) else item)
+            else:
+                result.append(item)
+        return result
+    return env
+ 
+for svc in (data.get("services") or {}).values():
+    if "environment" in svc:
+        svc["environment"] = redact_env(svc["environment"])
+ 
+with open(out, "w") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+PYSAFE
+rm -f "$RENDERED_JSON_TMP"
+ 
 # Detectar si los servicios de aplicación tienen una configuración de conexión a BD
 # que contradiga el servicio DB. No se modifica el Compose: se informa y se detiene
 # únicamente cuando la contradicción es inequívoca.
@@ -1602,13 +1888,13 @@ j=json.loads(sys.argv[1]); dbsvc=sys.argv[2]; dbname=sys.argv[3]; dbuser=sys.arg
 project_env=sys.argv[6]
 services=j.get('services') or {}
 errors=[]; warnings=[]
-
+ 
 def env_map(c):
     env=c.get('environment') or {}
     if isinstance(env,list):
         env={x.split('=',1)[0]:x.split('=',1)[1] if '=' in x else '' for x in env}
     return {str(k): '' if v is None else str(v) for k,v in env.items()}
-
+ 
 def project_env_map(path):
     out={}
     if not os.path.isfile(path): return out
@@ -1617,12 +1903,12 @@ def project_env_map(path):
         if not line or line.startswith('#') or '=' not in line: continue
         k,v=line.split('=',1); out[k.strip()]=v.strip().strip('"').strip("'")
     return out
-
+ 
 def first(env, keys):
     for k in keys:
         if k in env and env[k] != '': return env[k]
     return ''
-
+ 
 db=services.get(dbsvc) or {}
 dbenv=env_map(db)
 db_port=''
@@ -1633,18 +1919,18 @@ for p in db.get('ports') or []:
 # container's native port is preferable to the published host port
 if not db_port:
     db_port='5432' if 'POSTGRES' in ' '.join(dbenv.keys()) else '3306'
-
+ 
 db_networks=set((db.get('networks') or {}).keys())
 if not db_networks:
     db_networks={'default'}
-
+ 
 host_keys={'DB_HOST','DATABASE_HOST','MYSQL_HOST','MARIADB_HOST','POSTGRES_HOST'}
 port_keys={'DB_PORT','DATABASE_PORT','MYSQL_PORT','MARIADB_PORT','POSTGRES_PORT'}
 name_keys={'DB_DATABASE','DATABASE_NAME','MYSQL_DATABASE','MARIADB_DATABASE','POSTGRES_DB'}
 user_keys={'DB_USERNAME','DB_USER','DATABASE_USER','MYSQL_USER','MARIADB_USER','POSTGRES_USER'}
 pass_keys={'DB_PASSWORD','DATABASE_PASSWORD','MYSQL_PASSWORD','MARIADB_PASSWORD','POSTGRES_PASSWORD'}
 project_env=project_env_map(project_env)
-
+ 
 for name,c in services.items():
     if name==dbsvc: continue
     env=env_map(c)
@@ -1656,7 +1942,7 @@ for name,c in services.items():
     database=first(merged,name_keys)
     user=first(merged,user_keys)
     password=first(merged,pass_keys)
-
+ 
     # Soporte universal para DATABASE_URL / DATABASE_URI usados por muchos frameworks.
     database_url=first(merged,{'DATABASE_URL','DATABASE_URI'})
     if database_url:
@@ -1670,29 +1956,29 @@ for name,c in services.items():
             if not password: password=unquote(u.password or '')
         except Exception:
             warnings.append(f"{name}: DATABASE_URL no pudo analizarse automáticamente; se respetará sin modificarla.")
-
+ 
     if not any([host,port,database,user,password]):
         continue
-
+ 
     if host in {'localhost','127.0.0.1','::1'} and len(services)>1:
         errors.append(f"{name}: DB_HOST='{host}' apunta al propio contenedor; debe usar el nombre del servicio Docker '{dbsvc}'.")
     elif host and host != dbsvc and host not in {str(db.get('container_name','')), dbsvc}:
         warnings.append(f"{name}: DB_HOST='{host}'. No se modificará porque podría ser un host externo válido.")
-
+ 
     if database and dbname and database != dbname:
         errors.append(f"{name}: base configurada='{database}' pero la BD gestionada='{dbname}'.")
     if user and dbuser and user != dbuser:
         errors.append(f"{name}: usuario configurado='{user}' pero usuario gestionado='{dbuser}'.")
     if password and dbpass and password != dbpass:
         errors.append(f"{name}: la contraseña configurada para la BD no coincide con la del usuario gestionado.")
-
+ 
     if port and host == dbsvc and port.isdigit() and port != db_port:
         errors.append(f"{name}: DB_PORT={port} usa el puerto publicado/incorrecto; el servicio '{dbsvc}' escucha internamente en {db_port}.")
-
+ 
     app_networks=set((c.get('networks') or {}).keys()) or {'default'}
     if not (app_networks & db_networks):
         errors.append(f"{name}: no comparte ninguna red Docker con '{dbsvc}'.")
-
+ 
 if warnings:
     print('⚠️ Advertencias de conexión BD:')
     for x in warnings: print('   '+x)
@@ -1709,19 +1995,19 @@ PYDB
     fi
     return "$rc"
 }
-
+ 
 validate_app_db_configuration
-
+ 
 # SOLO después de validar la topología app↔BD y las credenciales declaradas se permite construir.
 # Así un error de DB_HOST/DB_PORT/usuario/red se detecta antes de gastar tiempo en el build.
 if grep -qE '^\s*build:' <<<"$COMPOSE_CONFIG"; then
     echo "🔨 Validando/build de los Dockerfiles declarados por Compose..."
-    if ! docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" build; then
+    if ! docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" build; then
         echo "❌ Falló la construcción de una imagen declarada por Compose."
         exit 1
     fi
 fi
-
+ 
 ANALYSIS_FILE="$CARPETA_DESTINO/resource-analysis.txt"
 printf "%s\n" "$RENDERED_JSON" > "$CARPETA_DESTINO/compose.rendered.json.tmp"
 python3 - "$CARPETA_DESTINO/compose.rendered.json.tmp" "$ANALYSIS_FILE" <<'PY'
@@ -1733,7 +2019,7 @@ lines=[]
 services=d.get('services') or {}
 volumes=d.get('volumes') or {}
 networks=d.get('networks') or {}
-
+ 
 lines.append('[SERVICES]')
 for s,c in services.items():
     if c.get('container_name'):
@@ -1750,28 +2036,28 @@ for s,c in services.items():
             source=m.get('source','')
             target=m.get('target','')
             lines.append(f'MOUNT|{s}|{typ}|{source}|{target}')
-
+ 
 lines.append('[VOLUMES]')
 for name,v in volumes.items():
     lines.append(f'VOLUME|{name}|name={v.get("name","")}|external={v.get("external",False)}')
-
+ 
 lines.append('[NETWORKS]')
 for name,n in networks.items():
     lines.append(f'NETWORK|{name}|name={n.get("name","")}|external={n.get("external",False)}')
-
+ 
 open(out,'w').write('\n'.join(lines)+'\n')
 PY
 rm -f "$CARPETA_DESTINO/compose.rendered.json.tmp"
-
+ 
 # ------------------------------------------------------------------------------
 # 7. Verificación estricta de aislamiento
 # ------------------------------------------------------------------------------
 echo "================================================="
 echo "🛡️ 4. Verificando aislamiento de la instancia $NOMBRE_CARPETA"
 echo "================================================="
-
+ 
 CONFLICT=0
-
+ 
 while IFS='|' read -r kind svc cname; do
     [ "$kind" = "CONTAINER_NAME" ] || continue
     if docker ps -a --format '{{.Names}}' | grep -Fxq "$cname"; then
@@ -1780,7 +2066,7 @@ while IFS='|' read -r kind svc cname; do
         CONFLICT=1
     fi
 done < "$ANALYSIS_FILE"
-
+ 
 while IFS='|' read -r kind vname namepart externalpart; do
     [ "$kind" = "VOLUME" ] || continue
     fixed_name="${namepart#name=}"
@@ -1795,7 +2081,7 @@ while IFS='|' read -r kind vname namepart externalpart; do
         CONFLICT=1
     fi
 done < "$ANALYSIS_FILE"
-
+ 
 while IFS='|' read -r kind nname namepart externalpart; do
     [ "$kind" = "NETWORK" ] || continue
     fixed_name="${namepart#name=}"
@@ -1810,7 +2096,7 @@ while IFS='|' read -r kind nname namepart externalpart; do
         CONFLICT=1
     fi
 done < "$ANALYSIS_FILE"
-
+ 
 while IFS='|' read -r kind svc typ source target; do
     [ "$kind" = "MOUNT" ] || continue
     if [ "$typ" = "bind" ]; then
@@ -1824,7 +2110,7 @@ while IFS='|' read -r kind svc typ source target; do
         esac
     fi
 done < "$ANALYSIS_FILE"
-
+ 
 while IFS='|' read -r kind svc host target proto; do
     [ "$kind" = "PORT" ] || continue
     [ -n "$host" ] || continue
@@ -1834,7 +2120,7 @@ while IFS='|' read -r kind svc host target proto; do
         CONFLICT=1
     fi
 done < "$ANALYSIS_FILE"
-
+ 
 while IFS='|' read -r kind svc host target proto; do
     [ "$kind" = "PORT" ] || continue
     [ -n "$host" ] || continue
@@ -1844,7 +2130,7 @@ while IFS='|' read -r kind svc host target proto; do
         CONFLICT=1
     fi
 done < "$ANALYSIS_FILE"
-
+ 
 if [ "$CONFLICT" -ne 0 ]; then
     echo ""
     echo "🛑 DESPLIEGUE DETENIDO ANTES DE docker compose up."
@@ -1852,57 +2138,118 @@ if [ "$CONFLICT" -ne 0 ]; then
     echo "   Revisa '$CARPETA_DESTINO/resource-analysis.txt'."
     exit 1
 fi
-
+ 
 echo "✅ No se detectaron recursos fijos/external que puedan colisionar."
-
+ 
 # ------------------------------------------------------------------------------
 # 8. Preflight de imágenes: conservar exactamente la imagen declarada
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 8. PREFLIGHT DE IMÁGENES
+#
+# REGLAS UNIVERSALES:
+#
+#   Servicio con build:
+#       -> Compose construirá usando SU context + SU Dockerfile.
+#
+#   Servicio sin build + image:
+#       -> usar imagen local
+#       -> si no existe, intentar pull
+#       -> si tampoco existe, ERROR
+#
+# NUNCA:
+#       -> buscar otro Dockerfile arbitrariamente
+#       -> construir una image desde un Dockerfile que pertenece a otro servicio
+# ------------------------------------------------------------------------------
+ 
 preflight_images() {
-    local svc image has_build dockerfile_path
+    local svc
+    local image
+    local has_build
+    local dockerfile
+ 
     for svc in "${SERVICES[@]}"; do
-        has_build=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
-            $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:/{exit}
-            inside && /^ *build:/{print 1;exit}')
-        image=$(printf '%s\n' "$COMPOSE_CONFIG" | awk -v s="  $svc:" '
-            $0==s{inside=1;next} inside && /^  [A-Za-z0-9_.-]+:/{exit}
-            inside && /^ *image:/{sub(/^ *image:[[:space:]]*/,"");print;exit}')
-
-        [ -n "$has_build" ] && continue
-        [ -n "$image" ] || continue
-
-        # 1. ¿Existe localmente?
+ 
+        image="${SERVICE_IMAGE[$svc]:-}"
+        has_build="${SERVICE_HAS_BUILD[$svc]:-0}"
+        dockerfile="${SERVICE_DOCKERFILE[$svc]:-}"
+ 
+        echo ""
+        echo "🔎 Preflight: $svc"
+        echo "   image : ${image:-(ninguna)}"
+        echo "   build : $has_build"
+ 
+        # ------------------------------------------------------------------
+        # 1. BUILD DECLARADO
+        # ------------------------------------------------------------------
+        if [ "$has_build" = "1" ]; then
+ 
+            if [ -z "$dockerfile" ]; then
+                echo "❌ $svc declara build pero no tiene Dockerfile resuelto."
+                echo "   Contexto: ${SERVICE_BUILD_CONTEXT[$svc]:-(desconocido)}"
+                return 1
+            fi
+ 
+            if [ ! -f "$dockerfile" ]; then
+                echo "❌ Dockerfile inexistente para '$svc':"
+                echo "   $dockerfile"
+                return 1
+            fi
+ 
+            echo "   ✅ Build válido."
+            echo "   Contexto   : ${SERVICE_BUILD_CONTEXT[$svc]}"
+            echo "   Dockerfile : $dockerfile"
+ 
+            continue
+        fi
+ 
+        # ------------------------------------------------------------------
+        # 2. NO HAY BUILD -> DEBE EXISTIR IMAGE
+        # ------------------------------------------------------------------
+        if [ -z "$image" ]; then
+            echo "❌ El servicio '$svc' no tiene ni 'build' ni 'image'."
+            return 1
+        fi
+ 
+        # ------------------------------------------------------------------
+        # 3. IMAGE LOCAL
+        # ------------------------------------------------------------------
         if docker image inspect "$image" >/dev/null 2>&1; then
-            echo "✅ Imagen disponible localmente: $svc -> $image"
+            echo "   ✅ Imagen local disponible: $image"
             continue
         fi
-
-        # 2. ¿Se puede descargar exactamente esa imagen?
-        if docker manifest inspect "$image" >/dev/null 2>&1; then
-            echo "⬇️ Descargando imagen: $svc -> $image"
-            docker pull "$image"
+ 
+        # ------------------------------------------------------------------
+        # 4. IMAGE REMOTA
+        # ------------------------------------------------------------------
+        echo "   ⬇️ Imagen no encontrada localmente."
+        echo "   Intentando descargar: $image"
+ 
+        if docker pull "$image"; then
+            echo "   ✅ Imagen descargada correctamente."
             continue
         fi
-
-        # 3. ¿Existe Dockerfile en el contenido extraído (incluye .zip_extract)?
-        #    Reconoce también los generados por el script (Dockerfile.generated,
-        #    Dockerfile.prod, etc.), no solo el nombre exacto "Dockerfile".
-        dockerfile_path=$(find "$INSTANCE_SOURCE" -type f \( -name "Dockerfile" -o -name "Dockerfile.*" \) | head -n 1)
-        if [ -n "$dockerfile_path" ]; then
-            echo "🔨 Construyendo imagen '$image' desde $(dirname "$dockerfile_path") ($(basename "$dockerfile_path"))..."
-            docker build -t "$image" -f "$dockerfile_path" "$(dirname "$dockerfile_path")"
-            continue
-        fi
-
-        # Falla si se agotan todas las vías legítimas
-        echo "❌ No se puede obtener la imagen declarada '$image' para '$svc'."
-        echo "   El instalador universal NO sustituirá automáticamente por ':latest'."
-        exit 1
+ 
+        # ------------------------------------------------------------------
+        # 5. ERROR REAL
+        # ------------------------------------------------------------------
+        echo ""
+        echo "❌ No se pudo resolver la imagen del servicio '$svc'."
+        echo ""
+        echo "   image : $image"
+        echo "   build : no"
+        echo ""
+        echo "   El Bash universal NO buscará otro Dockerfile."
+        echo "   Debes declarar un build o proporcionar una image válida."
+        echo ""
+ 
+        return 1
     done
+ 
+    return 0
 }
-
-preflight_images
-
+preflight_images || exit 1
+ 
 # ------------------------------------------------------------------------------
 # 9. Guardar manifiesto ANTES del despliegue
 # ------------------------------------------------------------------------------
@@ -1927,12 +2274,56 @@ DOCKERFILE_GENERATED=$([[ "${INSTANCE_DOCKERFILE_PATH:-}" == *.generated ]] && e
 COMPOSE_SOURCE=$(basename "${COMPOSE_FILE:-}")
 COMPOSE_GENERATED=$([[ "${COMPOSE_FILE:-}" == *.generated.yml ]] && echo yes || echo no)
 EOF
-
+ 
 {
     echo "# Recursos renderizados para $NOMBRE_CARPETA"
     cat "$ANALYSIS_FILE"
 } >> "$MANIFEST"
-
+ 
+# ------------------------------------------------------------------------------
+# 9.1 Manifiesto estructurado (deployment-manifest.json)
+# ------------------------------------------------------------------------------
+# Solo información operacional. Nunca contiene credenciales, tokens ni
+# contraseñas: DB_APP_PASS, REPO_AUTH_TOKEN, etc. quedan fuera a propósito.
+# Se genera al final (tras verificar el stack) con el estado real; aquí solo
+# se capturan datos del commit desplegado, que no cambian.
+DEPLOY_COMMIT=""
+DEPLOY_BRANCH=""
+if [ -d "$REPO_DIR_ORIGINAL/.git" ]; then
+    DEPLOY_COMMIT=$(git -C "$REPO_DIR_ORIGINAL" rev-parse HEAD 2>/dev/null || true)
+    DEPLOY_BRANCH=$(git -C "$REPO_DIR_ORIGINAL" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+fi
+ 
+write_deployment_manifest() {
+    # $1 = status ("success" | "failed")
+    local status="$1"
+    local out="$CARPETA_DESTINO/deployment-manifest.json"
+    COMPOSE_FILES_JOINED=$(printf '%s\x1f' "${COMPOSE_FILES[@]}") \
+    SERVICES_JOINED=$(printf '%s\x1f' "${SERVICES[@]:-}") \
+    python3 - "$out" "$SYSTEM_NAME" "$NOMBRE_CARPETA" "$REPO_URL" "$DEPLOY_COMMIT" "$DEPLOY_BRANCH" "$COMPOSE_PROJECT_NAME" "$status" <<'PYMANIFEST'
+import json, sys, subprocess, os
+ 
+out, system_name, instance, repo_url, commit, branch, project_name, status = sys.argv[1:9]
+compose_files = [c for c in os.environ.get("COMPOSE_FILES_JOINED", "").split("\x1f") if c]
+services = [s for s in os.environ.get("SERVICES_JOINED", "").split("\x1f") if s]
+ 
+data = {
+    "system": system_name,
+    "instance": instance,
+    "repository": repo_url,
+    "branch": branch,
+    "commit": commit,
+    "compose_files": [os.path.basename(c) for c in compose_files],
+    "services": services,
+    "project_name": project_name,
+    "created_at": subprocess.check_output(["date", "-Is"]).decode().strip(),
+    "status": status,
+}
+with open(out, "w") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+PYMANIFEST
+}
+ 
 # ------------------------------------------------------------------------------
 # 10. Levantar instancia NUEVA
 # ------------------------------------------------------------------------------
@@ -1943,14 +2334,14 @@ echo "📦 Proyecto Compose : $COMPOSE_PROJECT_NAME"
 echo "💾 Política         : volumen nuevo/aislado"
 echo "🛑 No se ejecutará  : docker compose down -v"
 echo ""
-
+ 
 docker compose \
     --env-file "$INSTANCE_ENV" \
-    -f "$COMPOSE_FILE" \
+    "${COMPOSE_F_ARGS[@]}" \
     --project-directory "$INSTANCE_SOURCE" \
     -p "$COMPOSE_PROJECT_NAME" \
     up -d --build --remove-orphans
-
+ 
 # ------------------------------------------------------------------------------
 # 10.1 CORRECCIÓN UNIVERSAL DE PERMISOS (evita 403 Forbidden en cualquier stack)
 # ------------------------------------------------------------------------------
@@ -1964,7 +2355,7 @@ echo "================================================="
 echo "🔐 5.1 Normalizando permisos dentro de los contenedores (evita 403 Forbidden)..."
 echo "================================================="
 COMMON_WEBROOTS="/var/www/html /var/www /usr/share/nginx/html /app /srv/www /home/site/wwwroot"
-RUNNING_CONTAINERS=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q 2>/dev/null || true)
+RUNNING_CONTAINERS=$(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q 2>/dev/null || true)
 for cid in $RUNNING_CONTAINERS; do
     cname=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')
     for webroot in $COMMON_WEBROOTS; do
@@ -1976,7 +2367,7 @@ for cid in $RUNNING_CONTAINERS; do
             echo "   ✅ Permisos normalizados en $cname:$webroot" || true
     done
 done
-
+ 
 # ------------------------------------------------------------------------------
 # 11. Esperar BD
 # ------------------------------------------------------------------------------
@@ -1985,14 +2376,14 @@ if [ -n "$DB_SERVICE" ] && [ "$DB_MODE" != "3" ]; then
     echo "================================================="
     echo "⏳ 6. Esperando BD '$DB_SERVICE'"
     echo "================================================="
-
+ 
     for intento in $(seq 1 60); do
-        DB_CONTAINER=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$DB_SERVICE" 2>/dev/null || true)
+        DB_CONTAINER=$(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$DB_SERVICE" 2>/dev/null || true)
         [ -n "$DB_CONTAINER" ] && break
         sleep 2
 done
     [ -n "$DB_CONTAINER" ] || { echo "❌ No se encontró el contenedor de BD."; exit 1; }
-
+ 
     DB_READY=0
     for intento in $(seq 1 60); do
         DB_STATUS=$(docker inspect -f '{{.State.Status}}' "$DB_CONTAINER" 2>/dev/null || echo desconocido)
@@ -2010,7 +2401,7 @@ done
             fi
             exit 1
         fi
-
+ 
         case "$DB_ENGINE" in
             mysql|mariadb)
                 if docker exec "$DB_CONTAINER" mariadb-admin ping -u root --silent >/dev/null 2>&1 || \
@@ -2027,14 +2418,14 @@ done
                 DB_READY=1
                 ;;
         esac
-
+ 
         [ "$DB_READY" -eq 1 ] && break
         echo "   ... BD aún no está lista ($intento/60)"
         sleep 2
     done
-
+ 
     [ "$DB_READY" -eq 1 ] || { echo "❌ La BD no llegó a estar disponible."; exit 1; }
-
+ 
     # CORRECCIÓN CRUCIAL: un ping exitoso no garantiza que la BD esté lista
     # para enlazar. MySQL/MariaDB arrancan primero un servidor TEMPORAL para
     # ejecutar la inicialización (creación de datadir, scripts, etc.) y luego
@@ -2075,7 +2466,7 @@ done
     done
     [ "$DB_STABLE" -eq 1 ] || { echo "❌ La BD no logró estabilizarse tras el enlace inicial."; exit 1; }
     echo "✅ Base de datos lista y enlace estable."
-
+ 
     # --------------------------------------------------------------------------
     # 11.1 Comprobación REAL de red app -> BD
     # --------------------------------------------------------------------------
@@ -2089,10 +2480,10 @@ done
             [ -n "$svc" ] || continue
             [ "$svc" = "$DB_SERVICE" ] && continue
             [ "$host" = "$DB_SERVICE" ] || continue
-            cid=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$svc" 2>/dev/null || true)
+            cid=$(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$svc" 2>/dev/null || true)
             [ -n "$cid" ] || continue
             echo "🔌 Probando conectividad $svc -> $DB_SERVICE ($host:$port)..."
-
+ 
             # Intentos en orden: nc, bash /dev/tcp, PHP, Python, Node.
             if docker exec "$cid" sh -c "command -v nc >/dev/null 2>&1 && nc -z -w 5 '$host' '$port'" >/dev/null 2>&1; then
                 echo "   ✅ TCP accesible desde '$svc'."
@@ -2114,7 +2505,7 @@ done
                 echo "   ✅ TCP accesible desde '$svc'."
                 continue
             fi
-
+ 
             echo "❌ '$svc' no puede alcanzar '$DB_SERVICE' en $host:$port."
             echo "   Verifica DB_HOST, DB_PORT y las networks del Compose."
             return 1
@@ -2129,7 +2520,7 @@ if os.path.isfile(envpath):
         line=raw.strip()
         if line and not line.startswith('#') and '=' in line:
             k,v=line.split('=',1); project[k.strip()]=v.strip().strip('"').strip("'")
-
+ 
 def envmap(c):
     e=c.get('environment') or {}
     if isinstance(e,list): e={x.split('=',1)[0]:x.split('=',1)[1] if '=' in x else '' for x in e}
@@ -2155,7 +2546,7 @@ PYLIVE
 )
     }
     validate_live_app_db_network
-
+ 
     # --------------------------------------------------------------------------
     # 12. Inicialización MySQL/MariaDB sin destruir datos
     # --------------------------------------------------------------------------
@@ -2165,7 +2556,7 @@ PYLIVE
         else
             MYSQL_BIN=mysql
         fi
-
+ 
         root_exec() {
             if [ -n "$ROOT_PASSWORD_DETECTED" ]; then
                 docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u root -p"$ROOT_PASSWORD_DETECTED" "$@"
@@ -2173,7 +2564,7 @@ PYLIVE
                 docker exec "$DB_CONTAINER" "$MYSQL_BIN" -u root "$@"
             fi
         }
-
+ 
         # Verificación de compatibilidad de credenciales antes de crear el usuario.
         # Si Compose ya define MYSQL/MARIADB_USER+PASSWORD y el usuario eligió credenciales
         # diferentes, la aplicación podría intentar entrar con otras credenciales y fallar.
@@ -2193,7 +2584,7 @@ PYLIVE
                 exit 1
             fi
         fi
-
+ 
         DB_EXISTS=$(root_exec -N -B -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(sql_escape "$DB_NAME")';" 2>/dev/null || true)
         if [ "$DB_EXISTS" != "$DB_NAME" ]; then
             root_exec -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\`;"
@@ -2232,7 +2623,7 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
                 echo "ℹ️ La BD ya tiene $TABLE_COUNT tabla(s); se omite SQL para evitar duplicados."
             fi
         fi
-
+ 
         if [ -n "$DB_APP_USER" ] && [ "$CREATE_DB_USER" = "1" ]; then
             USER_ESC=$(sql_escape "$DB_APP_USER")
             PASS_ESC=$(sql_escape "$DB_APP_PASS")
@@ -2246,7 +2637,7 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
                 2) root_exec -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON \`$DB_NAME\`.* TO '$USER_ESC'@'%'; FLUSH PRIVILEGES;" ;;
             esac
             echo "✅ Usuario de aplicación configurado."
-
+ 
             # Comprobación real de autenticación con las credenciales creadas/reutilizadas.
             # Esto detecta antes del cierre del instalador un usuario inexistente, contraseña
             # desincronizada o permisos insuficientes.
@@ -2278,7 +2669,7 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
                 docker exec "$DB_CONTAINER" "$PG_BIN" -U "${DB_ADMIN_USER_DETECTED:-postgres}" "$@"
             fi
         }
-
+ 
         PG_DB_IDENT=$(printf '%s' "$DB_NAME" | sed 's/"/""/g')
         DB_EXISTS=$(pg_admin_exec -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$(sql_escape "$DB_NAME")';" 2>/dev/null | tr -d '[:space:]' || true)
         if [ "$DB_EXISTS" != "1" ]; then
@@ -2287,7 +2678,7 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
         else
             echo "✅ BD '$DB_NAME' ya existe; no se elimina ni reinicializa."
         fi
-
+ 
         if [ -n "$DB_APP_USER" ] && [ "$CREATE_DB_USER" = "1" ]; then
             PG_USER_IDENT=$(printf '%s' "$DB_APP_USER" | sed 's/"/""/g')
             if pg_admin_exec -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$(sql_escape "$DB_APP_USER")';" 2>/dev/null | grep -q '^1$'; then
@@ -2316,58 +2707,110 @@ if [ "$DB_MODE" = "2" ] && [ -n "$SQL_FILE" ]; then
         fi
     fi
 fi
-
+ 
 # ------------------------------------------------------------------------------
 # 13. Validación final de aislamiento y estado
 # ------------------------------------------------------------------------------
-FINAL_PS=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps --format json 2>/dev/null || true)
+# No basta con "cantidad running == cantidad esperada": un contenedor puede
+# estar RUNNING con healthcheck en FAILING (app caída dentro de un proceso
+# vivo). Regla real: si el servicio declara healthcheck, exigir HEALTHY;
+# si no lo declara, exigir RUNNING. EXITED/RESTARTING/UNHEALTHY = fallo.
+FINAL_PS=$(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps --format json 2>/dev/null || true)
 printf '%s\n' "$FINAL_PS" > "$CARPETA_DESTINO/containers.json"
-
-RUNNING_COUNT=$(docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
-EXPECTED_COUNT=${#SERVICES[@]}
-
-if [ "$RUNNING_COUNT" -lt "$EXPECTED_COUNT" ]; then
-    echo "⚠️ La instancia fue creada pero no todos los servicios están running ($RUNNING_COUNT/$EXPECTED_COUNT)."
-    echo "   Revisa: docker compose --env-file '$INSTANCE_ENV' -f '$COMPOSE_FILE' -p '$COMPOSE_PROJECT_NAME' ps"
-    echo "   Logs:   docker compose --env-file '$INSTANCE_ENV' -f '$COMPOSE_FILE' -p '$COMPOSE_PROJECT_NAME' logs"
+ 
+VERIFY_FAILED=0
+declare -A SERVICE_STATUS_MAP=()
+declare -A SERVICE_HEALTH_MAP=()
+ 
+verify_all_services() {
+    local svc cid state health has_healthcheck
+    for svc in "${SERVICES[@]}"; do
+        cid=$(docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" ps -q "$svc" 2>/dev/null || true)
+        if [ -z "$cid" ]; then
+            echo "❌ $svc  NO SE CREÓ EL CONTENEDOR"
+            SERVICE_STATUS_MAP["$svc"]="MISSING"
+            VERIFY_FAILED=1
+            continue
+        fi
+        state=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo "unknown")
+        has_healthcheck=$(docker inspect -f '{{if .State.Health}}yes{{else}}no{{end}}' "$cid" 2>/dev/null || echo "no")
+        health=""
+        [ "$has_healthcheck" = "yes" ] && health=$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "")
+ 
+        SERVICE_STATUS_MAP["$svc"]="$state"
+        SERVICE_HEALTH_MAP["$svc"]="$health"
+ 
+        if [ "$has_healthcheck" = "yes" ]; then
+            if [ "$health" = "healthy" ]; then
+                echo "$svc       ✓ HEALTHY"
+            else
+                echo "❌ $svc  UNHEALTHY (health=${health:-desconocido}, estado=$state)"
+                VERIFY_FAILED=1
+            fi
+        else
+            case "$state" in
+                running) echo "$svc       ✓ RUNNING" ;;
+                *)
+                    echo "❌ $svc  $state"
+                    VERIFY_FAILED=1
+                    ;;
+            esac
+        fi
+ 
+        if [ "$state" = "exited" ] || [ "$state" = "dead" ] || [ "$state" = "restarting" ] || \
+           { [ "$has_healthcheck" = "yes" ] && [ "$health" != "healthy" ]; }; then
+            echo "   ↳ Diagnóstico ($svc):"
+            docker compose --env-file "$INSTANCE_ENV" "${COMPOSE_F_ARGS[@]}" --project-directory "$INSTANCE_SOURCE" -p "$COMPOSE_PROJECT_NAME" logs --tail=100 "$svc" 2>/dev/null | sed 's/^/   /' || true
+        fi
+    done
+}
+verify_all_services
+ 
+if [ "$VERIFY_FAILED" -eq 1 ]; then
+    echo "⚠️ La instancia fue creada pero no todos los servicios están HEALTHY/RUNNING."
+    echo "   Revisa: docker compose --env-file '$INSTANCE_ENV' ${COMPOSE_F_ARGS[*]} -p '$COMPOSE_PROJECT_NAME' ps"
+    echo "   Logs:   docker compose --env-file '$INSTANCE_ENV' ${COMPOSE_F_ARGS[*]} -p '$COMPOSE_PROJECT_NAME' logs"
+    write_deployment_manifest "failed"
     exit 1
 fi
-
+ 
+write_deployment_manifest "success"
+ 
 # ------------------------------------------------------------------------------
 # 14. Reporte final
 # ------------------------------------------------------------------------------
 IP_SERVIDOR=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)
 IP_SERVIDOR=${IP_SERVIDOR:-localhost}
-
+ 
 cat > "$CARPETA_DESTINO/README-DEPLOY.txt" <<EOF
 INSTANCIA: $NOMBRE_CARPETA
 PROYECTO COMPOSE: $COMPOSE_PROJECT_NAME
 SISTEMA: $SYSTEM_NAME
 REPOSITORIO_ORIGINAL: $REPO_DIR_ORIGINAL
 FUENTE_DE_INSTANCIA: $INSTANCE_SOURCE
-COMPOSE: $COMPOSE_FILE
+COMPOSE: ${COMPOSE_FILES[*]}
 ENV DE INSTANCIA: $INSTANCE_ENV
 MANIFIESTO: $MANIFEST
-
+ 
 POLÍTICA:
 - Esta instancia es independiente de P1/P2/P3 anteriores.
 - No se ejecuta docker compose down -v automáticamente.
 - No se reutilizan volúmenes externos o con nombre fijo.
 - No se cambia automáticamente MySQL <-> MariaDB.
 - Los datos persistentes de esta instancia pertenecen a su proyecto Compose.
-
+ 
 COMANDOS:
 cd "$INSTANCE_SOURCE"
-docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" ps
-docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" logs -f
-docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" restart
-docker compose --env-file "$INSTANCE_ENV" -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" down
+docker compose --env-file "$INSTANCE_ENV" ${COMPOSE_F_ARGS[*]} -p "$COMPOSE_PROJECT_NAME" ps
+docker compose --env-file "$INSTANCE_ENV" ${COMPOSE_F_ARGS[*]} -p "$COMPOSE_PROJECT_NAME" logs -f
+docker compose --env-file "$INSTANCE_ENV" ${COMPOSE_F_ARGS[*]} -p "$COMPOSE_PROJECT_NAME" restart
+docker compose --env-file "$INSTANCE_ENV" ${COMPOSE_F_ARGS[*]} -p "$COMPOSE_PROJECT_NAME" down
 # Para borrar datos persistentes: NO hacerlo desde este instalador; requiere una operación explícita.
 EOF
-
+ 
 chmod 600 "$INSTANCE_ENV" 2>/dev/null || true
 chown "$SUDO_USER_NAME:$SUDO_USER_NAME" "$CARPETA_DESTINO" "$INSTANCE_ENV" "$MANIFEST" "$ANALYSIS_FILE" "$CARPETA_DESTINO/README-DEPLOY.txt" 2>/dev/null || true
-
+ 
 echo ""
 echo "================================================="
 echo "🎉 ¡DESPLIEGUE EXITOSO!"
