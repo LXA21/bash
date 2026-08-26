@@ -222,26 +222,93 @@ fi
 read -r -p "👉 URL del repositorio Git: " REPO_URL
 [ -n "$REPO_URL" ] || { echo "❌ Debes indicar una URL Git."; exit 1; }
  
+REPO_BASENAME=$(basename "${REPO_URL%/}")
+REPO_BASENAME=${REPO_BASENAME%.git}
+DEFAULT_SYSTEM_NAME=$(sanitize_name "$REPO_BASENAME")
+DEFAULT_SYSTEM_NAME=${DEFAULT_SYSTEM_NAME:-sistema}
+ 
+read -r -p "👉 Nombre del sistema [$DEFAULT_SYSTEM_NAME]: " SYSTEM_NAME
+SYSTEM_NAME=${SYSTEM_NAME:-$DEFAULT_SYSTEM_NAME}
+SYSTEM_NAME=$(sanitize_name "$SYSTEM_NAME")
+[ -n "$SYSTEM_NAME" ] || { echo "❌ Nombre de sistema inválido."; exit 1; }
+ 
+REPO_DIR="$ESCRITORIO/$SYSTEM_NAME"
+ 
+# Por defecto cada despliegue exige una descarga NUEVA desde el remoto. Pero
+# si ya existe una copia local de una ejecución anterior con ese mismo
+# nombre de sistema, en un escenario de despliegue MÚLTIPLE (varias
+# instancias del mismo sistema: P1, P2, P3...) volver a descargar/clonar
+# cada vez es lento e innecesario (red, autenticación, tamaño del repo).
+# Se ofrece reutilizar esa copia local como base de la NUEVA instancia.
+# Esto es seguro: REPO_DIR nunca se usa directamente para levantar
+# contenedores, más abajo el script SIEMPRE copia su contenido (tar) hacia
+# Pn/source antes de tocar Docker, así que reutilizar el repositorio base
+# no rompe el aislamiento entre instancias ni las políticas de datos.
+REPO_REUSE_LOCAL=0
+if [ -e "$REPO_DIR" ]; then
+    echo "⚠️ Ya existe '$REPO_DIR' de un despliegue anterior."
+    echo ""
+    echo "1) Reutilizar la copia local existente (rápido, sin descargar nada)"
+    echo "2) Eliminarla y descargar/clonar de nuevo desde el remoto"
+    echo "3) Cancelar"
+    while :; do
+        read -r -p "👉 Opción [1/2/3]: " RESP_REPO_EXISTS
+        case "$RESP_REPO_EXISTS" in
+            1)
+                if [ -z "$(find "$REPO_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+                    echo "❌ '$REPO_DIR' existe pero está vacío; no puede reutilizarse."
+                    continue
+                fi
+                REPO_REUSE_LOCAL=1
+                echo "♻️  Se reutilizará la copia local existente en: $REPO_DIR"
+                break
+                ;;
+            2)
+                REPO_DIR_REAL=$(realpath -m "$REPO_DIR")
+                ESCRITORIO_REAL=$(realpath -m "$ESCRITORIO")
+                if [ "$REPO_DIR_REAL" = "/" ] || [ "$REPO_DIR_REAL" = "$USER_HOME" ] || \
+                   [ "$REPO_DIR_REAL" = "$ESCRITORIO_REAL" ] || [ "${REPO_DIR_REAL#$ESCRITORIO_REAL/}" = "$REPO_DIR_REAL" ]; then
+                    echo "❌ Ruta insegura para eliminar, abortando: $REPO_DIR_REAL"
+                    exit 1
+                fi
+                rm -rf "$REPO_DIR_REAL"
+                break
+                ;;
+            3)
+                echo "❌ Cancelado. Elige otro nombre de sistema o elimina manualmente '$REPO_DIR'."
+                exit 1
+                ;;
+            *)
+                echo "   Opción inválida."
+                ;;
+        esac
+    done
+fi
+ 
 # --------------------------------------------------------------------------
 # Público / privado + credenciales (nunca se imprimen, nunca se guardan
 # dentro del proyecto ni en el repo clonado). Se usan solo durante el clone
-# mediante GIT_ASKPASS, y se destruyen inmediatamente después.
+# mediante GIT_ASKPASS, y se destruyen inmediatamente después. Si se va a
+# reutilizar la copia local, esto se omite: no tiene sentido pedir
+# credenciales para una descarga que no va a ocurrir.
 # --------------------------------------------------------------------------
 REPO_VISIBILITY=""
 REPO_AUTH_USER=""
 REPO_AUTH_TOKEN=""
 REPO_AUTH_REQUIRED=0
  
-while [ "$REPO_VISIBILITY" != "1" ] && [ "$REPO_VISIBILITY" != "2" ]; do
-    read -r -p "👉 ¿Repositorio público o privado? [1=Público / 2=Privado]: " REPO_VISIBILITY
-done
+if [ "$REPO_REUSE_LOCAL" -eq 0 ]; then
+    while [ "$REPO_VISIBILITY" != "1" ] && [ "$REPO_VISIBILITY" != "2" ]; do
+        read -r -p "👉 ¿Repositorio público o privado? [1=Público / 2=Privado]: " REPO_VISIBILITY
+    done
  
-if [ "$REPO_VISIBILITY" = "2" ]; then
-    REPO_AUTH_REQUIRED=1
-    read -r -p "👉 Usuario de acceso: " REPO_AUTH_USER
-    read -r -s -p "👉 Token/contraseña de acceso: " REPO_AUTH_TOKEN
-    echo ""
-    [ -n "$REPO_AUTH_TOKEN" ] || { echo "❌ Debes indicar un token/contraseña para un repositorio privado."; exit 1; }
+    if [ "$REPO_VISIBILITY" = "2" ]; then
+        REPO_AUTH_REQUIRED=1
+        read -r -p "👉 Usuario de acceso: " REPO_AUTH_USER
+        read -r -s -p "👉 Token/contraseña de acceso: " REPO_AUTH_TOKEN
+        echo ""
+        [ -n "$REPO_AUTH_TOKEN" ] || { echo "❌ Debes indicar un token/contraseña para un repositorio privado."; exit 1; }
+    fi
 fi
  
 clone_repository_remote() {
@@ -283,49 +350,17 @@ clone_repository_remote() {
     return "$rc"
 }
  
-REPO_BASENAME=$(basename "${REPO_URL%/}")
-REPO_BASENAME=${REPO_BASENAME%.git}
-DEFAULT_SYSTEM_NAME=$(sanitize_name "$REPO_BASENAME")
-DEFAULT_SYSTEM_NAME=${DEFAULT_SYSTEM_NAME:-sistema}
- 
-read -r -p "👉 Nombre del sistema [$DEFAULT_SYSTEM_NAME]: " SYSTEM_NAME
-SYSTEM_NAME=${SYSTEM_NAME:-$DEFAULT_SYSTEM_NAME}
-SYSTEM_NAME=$(sanitize_name "$SYSTEM_NAME")
-[ -n "$SYSTEM_NAME" ] || { echo "❌ Nombre de sistema inválido."; exit 1; }
- 
-REPO_DIR="$ESCRITORIO/$SYSTEM_NAME"
- 
-# Cada despliegue exige una descarga NUEVA. Si ya existe una carpeta con ese
-# nombre (de una ejecución anterior), nunca se reutiliza como origen: se pide
-# borrarla, renombrar el sistema o cancelar.
-if [ -e "$REPO_DIR" ]; then
-    echo "⚠️ Ya existe '$REPO_DIR' de un despliegue anterior."
-    echo "   El repositorio remoto debe descargarse siempre de nuevo; no se reutiliza código local."
-    read -r -p "👉 ¿Eliminar esa copia y volver a descargar? [s/N]: " RESP_REPO_EXISTS
-    case "${RESP_REPO_EXISTS,,}" in
-        s|si|sí|y|yes)
-            REPO_DIR_REAL=$(realpath -m "$REPO_DIR")
-            ESCRITORIO_REAL=$(realpath -m "$ESCRITORIO")
-            if [ "$REPO_DIR_REAL" = "/" ] || [ "$REPO_DIR_REAL" = "$USER_HOME" ] || \
-               [ "$REPO_DIR_REAL" = "$ESCRITORIO_REAL" ] || [ "${REPO_DIR_REAL#$ESCRITORIO_REAL/}" = "$REPO_DIR_REAL" ]; then
-                echo "❌ Ruta insegura para eliminar, abortando: $REPO_DIR_REAL"
-                exit 1
-            fi
-            rm -rf "$REPO_DIR_REAL"
-            ;;
-        *)
-            echo "❌ Cancelado. Elige otro nombre de sistema o elimina manualmente '$REPO_DIR'."
-            exit 1
-            ;;
-    esac
-fi
- 
 # ------------------------------------------------------------------------------
-# 0.3 Descargar/clonar repositorio sin destruir una copia existente
+# 0.3 Descargar/clonar repositorio (se omite si se reutiliza la copia local)
 # ------------------------------------------------------------------------------
 echo "================================================="
-echo "📥 0.3 Obteniendo repositorio"
-echo "================================================="
+if [ "$REPO_REUSE_LOCAL" -eq 1 ]; then
+    echo "📁 0.3 Reutilizando repositorio local (sin descarga)"
+    echo "================================================="
+    echo "✅ Usando copia existente en: $REPO_DIR"
+else
+    echo "📥 0.3 Obteniendo repositorio"
+    echo "================================================="
  
 extract_repository_zip() {
     local zip_file="$1" dest="$2" extract_dir top_dir depth rc
@@ -490,6 +525,7 @@ case "$IS_ZIP_URL" in
         done
         ;;
 esac
+fi
  
 $SUDO chown -R "$SUDO_USER_NAME:$SUDO_USER_NAME" "$REPO_DIR" 2>/dev/null || true
  
