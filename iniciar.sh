@@ -90,9 +90,61 @@ prompt_yes_no() {
     answer=${answer:-$default}
     [[ "$answer" =~ ^[SsYy]$ ]]
 }
+# ------------------------------------------------------------------------------
+# 0. Usuario administrativo
+# ------------------------------------------------------------------------------
+echo "================================================="
+echo "👤 0.1 Configuración del usuario administrativo"
+echo "================================================="
+ 
+SUDO_USER_NAME="${1:-}"
+if [ -z "$SUDO_USER_NAME" ]; then
+    read -r -p "👉 Nombre del usuario sudo a crear/usar: " SUDO_USER_NAME
+fi
+[ -n "$SUDO_USER_NAME" ] || { echo "❌ Usuario vacío."; exit 1; }
+ 
+if ! id "$SUDO_USER_NAME" >/dev/null 2>&1; then
+    while :; do
+        read -r -s -p "👉 Contraseña para '$SUDO_USER_NAME' (obligatoria): " SUDO_USER_PASS
+        echo ""
+        [ -n "$SUDO_USER_PASS" ] || { echo "❌ La contraseña del usuario sudo es obligatoria."; continue; }
+        read -r -s -p "👉 Confirmar contraseña: " SUDO_USER_PASS_CONFIRM
+        echo ""
+        [ "$SUDO_USER_PASS" = "$SUDO_USER_PASS_CONFIRM" ] && break
+        echo "❌ Las contraseñas no coinciden."
+    done
+    $SUDO useradd -m -s /bin/bash "$SUDO_USER_NAME"
+    $SUDO usermod -aG sudo "$SUDO_USER_NAME"
+    printf '%s:%s\n' "$SUDO_USER_NAME" "$SUDO_USER_PASS" | $SUDO chpasswd
+else
+    echo "✅ El usuario '$SUDO_USER_NAME' ya existe."
+    if ! id -nG "$SUDO_USER_NAME" | grep -qw sudo; then
+        $SUDO usermod -aG sudo "$SUDO_USER_NAME"
+    fi
+    # Un usuario sudo existente también debe tener contraseña.
+    if sudo passwd -S "$SUDO_USER_NAME" 2>/dev/null | awk '{print $2}' | grep -q '^L$'; then
+        echo "⚠️ La cuenta '$SUDO_USER_NAME' está bloqueada; se solicitará una contraseña nueva."
+        while :; do
+            read -r -s -p "👉 Nueva contraseña para '$SUDO_USER_NAME' (obligatoria): " SUDO_USER_PASS
+            echo ""
+            [ -n "$SUDO_USER_PASS" ] || { echo "❌ La contraseña es obligatoria."; continue; }
+            read -r -s -p "👉 Confirmar contraseña: " SUDO_USER_PASS_CONFIRM
+            echo ""
+            [ "$SUDO_USER_PASS" = "$SUDO_USER_PASS_CONFIRM" ] && break
+            echo "❌ Las contraseñas no coinciden."
+        done
+        printf '%s:%s\n' "$SUDO_USER_NAME" "$SUDO_USER_PASS" | $SUDO chpasswd
+    fi
+fi
+ 
+for U in "${USER:-}" "$SUDO_USER_NAME"; do
+    if [ -n "$U" ] && id "$U" >/dev/null 2>&1; then
+        id -nG "$U" | grep -qw docker || $SUDO usermod -aG docker "$U" 2>/dev/null || true
+    fi
+done
  
 # ------------------------------------------------------------------------------
-# 0. Docker y herramientas base
+# 0.1 Docker y herramientas base
 # ------------------------------------------------------------------------------
 echo "================================================="
 echo "🐳 0. Verificando Docker, Compose y herramientas..."
@@ -150,59 +202,7 @@ fi
 echo "✅ Docker: $(docker --version)"
 echo "✅ Compose: $(docker compose version --short 2>/dev/null || docker compose version)"
  
-# ------------------------------------------------------------------------------
-# 0.1 Usuario administrativo
-# ------------------------------------------------------------------------------
-echo "================================================="
-echo "👤 0.1 Configuración del usuario administrativo"
-echo "================================================="
- 
-SUDO_USER_NAME="${1:-}"
-if [ -z "$SUDO_USER_NAME" ]; then
-    read -r -p "👉 Nombre del usuario sudo a crear/usar: " SUDO_USER_NAME
-fi
-[ -n "$SUDO_USER_NAME" ] || { echo "❌ Usuario vacío."; exit 1; }
- 
-if ! id "$SUDO_USER_NAME" >/dev/null 2>&1; then
-    while :; do
-        read -r -s -p "👉 Contraseña para '$SUDO_USER_NAME' (obligatoria): " SUDO_USER_PASS
-        echo ""
-        [ -n "$SUDO_USER_PASS" ] || { echo "❌ La contraseña del usuario sudo es obligatoria."; continue; }
-        read -r -s -p "👉 Confirmar contraseña: " SUDO_USER_PASS_CONFIRM
-        echo ""
-        [ "$SUDO_USER_PASS" = "$SUDO_USER_PASS_CONFIRM" ] && break
-        echo "❌ Las contraseñas no coinciden."
-    done
-    $SUDO useradd -m -s /bin/bash "$SUDO_USER_NAME"
-    $SUDO usermod -aG sudo "$SUDO_USER_NAME"
-    printf '%s:%s\n' "$SUDO_USER_NAME" "$SUDO_USER_PASS" | $SUDO chpasswd
-else
-    echo "✅ El usuario '$SUDO_USER_NAME' ya existe."
-    if ! id -nG "$SUDO_USER_NAME" | grep -qw sudo; then
-        $SUDO usermod -aG sudo "$SUDO_USER_NAME"
-    fi
-    # Un usuario sudo existente también debe tener contraseña.
-    if sudo passwd -S "$SUDO_USER_NAME" 2>/dev/null | awk '{print $2}' | grep -q '^L$'; then
-        echo "⚠️ La cuenta '$SUDO_USER_NAME' está bloqueada; se solicitará una contraseña nueva."
-        while :; do
-            read -r -s -p "👉 Nueva contraseña para '$SUDO_USER_NAME' (obligatoria): " SUDO_USER_PASS
-            echo ""
-            [ -n "$SUDO_USER_PASS" ] || { echo "❌ La contraseña es obligatoria."; continue; }
-            read -r -s -p "👉 Confirmar contraseña: " SUDO_USER_PASS_CONFIRM
-            echo ""
-            [ "$SUDO_USER_PASS" = "$SUDO_USER_PASS_CONFIRM" ] && break
-            echo "❌ Las contraseñas no coinciden."
-        done
-        printf '%s:%s\n' "$SUDO_USER_NAME" "$SUDO_USER_PASS" | $SUDO chpasswd
-    fi
-fi
- 
-for U in "${USER:-}" "$SUDO_USER_NAME"; do
-    if [ -n "$U" ] && id "$U" >/dev/null 2>&1; then
-        id -nG "$U" | grep -qw docker || $SUDO usermod -aG docker "$U" 2>/dev/null || true
-    fi
-done
- 
+
 # ------------------------------------------------------------------------------
 # 0.2 Escritorio y repositorio
 # ------------------------------------------------------------------------------
