@@ -94,7 +94,7 @@ prompt_yes_no() {
 # 0. Usuario administrativo
 # ------------------------------------------------------------------------------
 echo "================================================="
-echo "👤 0.1 Configuración del usuario administrativo"
+echo "👤 0. Configuración del usuario administrativo"
 echo "================================================="
  
 SUDO_USER_NAME="${1:-}"
@@ -147,7 +147,7 @@ done
 # 0.1 Docker y herramientas base
 # ------------------------------------------------------------------------------
 echo "================================================="
-echo "🐳 0. Verificando Docker, Compose y herramientas..."
+echo "🐳 0.1 Verificando Docker, Compose y herramientas..."
 echo "================================================="
  
 if ! command_exists docker; then
