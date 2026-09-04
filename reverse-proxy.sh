@@ -57,8 +57,9 @@ USO:
 
 COMANDOS:
   install     Instala Docker (si falta), la red compartida y el proxy (nginx-proxy + acme-companion)
-  add         Publica un dominio/subdominio hacia un contenedor nuevo o existente
-  remove      Elimina una app publicada previamente (detiene y borra su contenedor)
+  add         Publica un dominio/subdominio hacia un contenedor nuevo o existente (admite alias con -a)
+  redirect    Crea una redirección 301 pura de un dominio hacia otra URL (sin backend real)
+  remove      Elimina una app/redirección publicada previamente
   list        Lista las apps/dominios actualmente publicados
   status      Muestra el estado de los contenedores del proxy y de las apps
   logs        Muestra logs del proxy, del emisor de certificados, o de una app
@@ -72,7 +73,9 @@ Ejecuta 'sudo $0 <comando> -h' para ver las opciones de cada comando.
 EJEMPLOS:
   sudo $0 install -e admin@midominio.com
   sudo $0 add -n blog -H blog.midominio.com -p 80 -m admin@midominio.com -i wordpress:latest
+  sudo $0 add -n web  -H midominio.com -a www.midominio.com -p 80 -i mi-app:latest
   sudo $0 add -n api  -H api.midominio.com  -p 3000 -m admin@midominio.com -c mi-api-existente
+  sudo $0 redirect -n old-blog -H viejo.midominio.com -t https://nuevo.midominio.com
   sudo $0 list
   sudo $0 certs
   sudo $0 renew -n blog
@@ -91,10 +94,10 @@ ensure_state_file() {
 }
 
 state_add() {
-  # id, dominio, puerto, tipo(nuevo|existente), referencia(imagen o contenedor)
+  # id, dominio, puerto, tipo(nuevo|existente|redirect), referencia(imagen|contenedor|destino), aliases(o "-")
   ensure_state_file
   state_remove_silent "$1"
-  printf "%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" >> "$STATE_FILE"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" "${6:--}" >> "$STATE_FILE"
 }
 
 state_remove_silent() {
@@ -249,9 +252,9 @@ EOF
 # COMANDO: add
 # ============================================================================
 cmd_add() {
-  local APP_NAME="" DOMAIN="" PORT="" IMAGE="" EXISTING_CONTAINER="" LE_EMAIL=""
+  local APP_NAME="" DOMAIN="" PORT="" IMAGE="" EXISTING_CONTAINER="" LE_EMAIL="" ALIASES=""
   local OPTIND opt
-  while getopts ":n:H:p:m:i:c:h" opt; do
+  while getopts ":n:H:p:m:i:c:a:h" opt; do
     case "$opt" in
       n) APP_NAME="$OPTARG" ;;
       H) DOMAIN="$OPTARG" ;;
@@ -259,12 +262,16 @@ cmd_add() {
       m) LE_EMAIL="$OPTARG" ;;
       i) IMAGE="$OPTARG" ;;
       c) EXISTING_CONTAINER="$OPTARG" ;;
+      a) ALIASES="$OPTARG" ;;
       h) cat <<EOF
-Uso: sudo $0 add -n <app> -H <dominio> -p <puerto> [-m <email>] (-i <imagen> | -c <contenedor-existente>)
+Uso: sudo $0 add -n <app> -H <dominio> -p <puerto> [-m <email>] [-a <alias1,alias2,...>] (-i <imagen> | -c <contenedor-existente>)
   -n   Nombre corto/identificador de la app (ej: blog, api, tienda)
-  -H   Dominio o subdominio completo (ej: blog.midominio.com)
+  -H   Dominio o subdominio PRINCIPAL (ej: blog.midominio.com)
   -p   Puerto interno que expone el contenedor (ej: 80, 3000, 8080)
-  -m   Email para el certificado Let's Encrypt de este dominio (opcional; usa el de 'install' si se omite)
+  -m   Email para el certificado Let's Encrypt (opcional; usa el de 'install' si se omite)
+  -a   Dominios/subdominios ADICIONALES que apuntan al MISMO contenedor,
+       separados por coma (ej: www.blog.midominio.com,blog-alt.com)
+       El certificado SSL cubrirá el dominio principal y todos los alias (SAN).
   -i   Imagen Docker a desplegar (crea un contenedor nuevo)
   -c   Nombre de un contenedor Docker YA EXISTENTE a conectar a la red proxy
 EOF
@@ -293,12 +300,21 @@ EOF
     fi
   fi
 
-  # Validación básica de formato de dominio
-  if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]; then
-    die "El dominio '${DOMAIN}' no tiene un formato válido."
-  fi
-  # Validación de puerto numérico
+  # Validación de formato para el dominio principal y cada alias
+  local _domain_regex='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
+  [[ "$DOMAIN" =~ $_domain_regex ]] || die "El dominio '${DOMAIN}' no tiene un formato válido."
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "El puerto '${PORT}' debe ser numérico."
+
+  local ALL_HOSTS="$DOMAIN"
+  if [[ -n "$ALIASES" ]]; then
+    IFS=',' read -ra _alias_arr <<< "$ALIASES"
+    for a in "${_alias_arr[@]}"; do
+      a="$(echo "$a" | xargs)"  # trim espacios
+      [[ -z "$a" ]] && continue
+      [[ "$a" =~ $_domain_regex ]] || die "El alias '${a}' no tiene un formato de dominio válido."
+      ALL_HOSTS="${ALL_HOSTS},${a}"
+    done
+  fi
 
   local APP_ID
   APP_ID="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
@@ -327,16 +343,16 @@ services:
     networks:
       - ${NETWORK_NAME}
     environment:
-      - VIRTUAL_HOST=${DOMAIN}
+      - VIRTUAL_HOST=${ALL_HOSTS}
       - VIRTUAL_PORT=${PORT}
-      - LETSENCRYPT_HOST=${DOMAIN}
+      - LETSENCRYPT_HOST=${ALL_HOSTS}
       - LETSENCRYPT_EMAIL=${LE_EMAIL}
 
 networks:
   ${NETWORK_NAME}:
     external: true
 EOF
-    state_add "$APP_ID" "$DOMAIN" "$PORT" "existente" "$EXISTING_CONTAINER"
+    state_add "$APP_ID" "$DOMAIN" "$PORT" "existente" "$EXISTING_CONTAINER" "${ALIASES:--}"
     log_ok "Referencia generada en: ${APP_DIR}/docker-compose.override.reference.yml"
     log_warn "Recuerda aplicar ese bloque y recrear el contenedor para activar el enrutamiento."
     return 0
@@ -352,9 +368,9 @@ services:
     networks:
       - ${NETWORK_NAME}
     environment:
-      - VIRTUAL_HOST=${DOMAIN}
+      - VIRTUAL_HOST=${ALL_HOSTS}
       - VIRTUAL_PORT=${PORT}
-      - LETSENCRYPT_HOST=${DOMAIN}
+      - LETSENCRYPT_HOST=${ALL_HOSTS}
       - LETSENCRYPT_EMAIL=${LE_EMAIL}
 
 networks:
@@ -364,9 +380,9 @@ EOF
 
   log_info "Levantando el contenedor '${APP_ID}'..."
   (cd "$APP_DIR" && docker compose up -d)
-  state_add "$APP_ID" "$DOMAIN" "$PORT" "nuevo" "$IMAGE"
+  state_add "$APP_ID" "$DOMAIN" "$PORT" "nuevo" "$IMAGE" "${ALIASES:--}"
 
-  log_ok "Listo. '${DOMAIN}' quedará enrutado hacia '${APP_ID}:${PORT}'."
+  log_ok "Listo. '${ALL_HOSTS}' quedará enrutado hacia '${APP_ID}:${PORT}'."
   echo "El certificado SSL se emite automáticamente en 30-90 segundos y"
   echo "acme-companion lo renovará solo, sin intervención, ~30 días antes de vencer."
   echo "Verifica con: sudo $0 certs -n ${APP_ID}   |   sudo $0 logs -n ${APP_ID}"
@@ -398,7 +414,7 @@ cmd_remove() {
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   local TIPO; TIPO="$(echo "$RECORD" | cut -f4)"
 
-  if [[ "$TIPO" == "nuevo" && -f "${APP_DIR}/docker-compose.yml" ]]; then
+  if [[ "$TIPO" == "nuevo" || "$TIPO" == "redirect" ]] && [[ -f "${APP_DIR}/docker-compose.yml" ]]; then
     log_info "Deteniendo y eliminando el contenedor '${APP_ID}'..."
     (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo bajar limpiamente; continúo."
   else
@@ -422,10 +438,10 @@ cmd_list() {
     log_info "No hay apps publicadas todavía. Usa: $0 add -h"
     return 0
   fi
-  printf "%-15s %-35s %-8s %-10s %s\n" "APP" "DOMINIO" "PUERTO" "TIPO" "REFERENCIA"
-  printf "%-15s %-35s %-8s %-10s %s\n" "---" "-------" "------" "----" "----------"
-  while IFS=$'\t' read -r id domain port tipo ref; do
-    printf "%-15s %-35s %-8s %-10s %s\n" "$id" "$domain" "$port" "$tipo" "$ref"
+  printf "%-15s %-30s %-8s %-10s %-20s %s\n" "APP" "DOMINIO" "PUERTO" "TIPO" "REFERENCIA" "ALIASES"
+  printf "%-15s %-30s %-8s %-10s %-20s %s\n" "---" "-------" "------" "----" "----------" "-------"
+  while IFS=$'\t' read -r id domain port tipo ref aliases; do
+    printf "%-15s %-30s %-8s %-10s %-20s %s\n" "$id" "$domain" "$port" "$tipo" "$ref" "${aliases:--}"
   done < "$STATE_FILE"
 }
 
@@ -443,7 +459,7 @@ cmd_status() {
     echo "  (ninguna)"
     return 0
   fi
-  while IFS=$'\t' read -r id domain port tipo ref; do
+  while IFS=$'\t' read -r id domain port tipo ref aliases; do
     local cname="$id"
     [[ "$tipo" == "existente" ]] && cname="$ref"
     if docker inspect "$cname" &>/dev/null; then
@@ -540,7 +556,7 @@ EOF
       return 0
     fi
     log_info "Estado de certificados:"
-    while IFS=$'\t' read -r id domain port tipo ref; do
+    while IFS=$'\t' read -r id domain port tipo ref aliases; do
       _print_cert_row "$domain"
     done < "$STATE_FILE"
   else
@@ -593,7 +609,7 @@ EOF
       log_info "No hay apps publicadas todavía."
       return 0
     fi
-    while IFS=$'\t' read -r id domain port tipo ref; do
+    while IFS=$'\t' read -r id domain port tipo ref aliases; do
       _force_renew_domain "$domain"
     done < "$STATE_FILE"
   else
@@ -608,6 +624,103 @@ EOF
   docker exec nginx-proxy nginx -s reload 2>/dev/null \
     && log_ok "nginx-proxy recargado." \
     || log_warn "No se pudo recargar nginx-proxy automáticamente; normalmente detecta el cambio solo."
+}
+
+# ============================================================================
+# COMANDO: redirect — redirección pura dominio -> URL destino (sin backend)
+# ============================================================================
+cmd_redirect() {
+  local APP_NAME="" DOMAIN="" TARGET_URL="" LE_EMAIL=""
+  local OPTIND opt
+  while getopts ":n:H:t:m:h" opt; do
+    case "$opt" in
+      n) APP_NAME="$OPTARG" ;;
+      H) DOMAIN="$OPTARG" ;;
+      t) TARGET_URL="$OPTARG" ;;
+      m) LE_EMAIL="$OPTARG" ;;
+      h) cat <<EOF
+Uso: sudo $0 redirect -n <app> -H <dominio-origen> -t <url-destino> [-m <email>]
+  -n   Nombre corto/identificador (ej: old-blog)
+  -H   Dominio o subdominio que va a redirigir (ej: viejo.midominio.com)
+  -t   URL completa de destino (ej: https://nuevo.midominio.com)
+  -m   Email para el certificado Let's Encrypt (opcional; usa el de 'install' si se omite)
+
+Crea un contenedor nginx minimalista que solo responde con un 301 hacia
+la URL destino, con SSL propio para el dominio de origen.
+EOF
+         exit 0 ;;
+      \?) die "Opción inválida: -$OPTARG" ;;
+      :)  die "La opción -$OPTARG requiere un argumento." ;;
+    esac
+  done
+
+  [[ -z "$APP_NAME" ]] && die "Falta -n (nombre de app). Usa: $0 redirect -h"
+  [[ -z "$DOMAIN"   ]] && die "Falta -H (dominio origen). Usa: $0 redirect -h"
+  [[ -z "$TARGET_URL" ]] && die "Falta -t (URL destino). Usa: $0 redirect -h"
+  [[ "$TARGET_URL" =~ ^https?:// ]] || die "La URL destino debe comenzar con http:// o https://"
+
+  require_root
+  [[ -f "${BASE_DIR}/docker-compose.yml" ]] || die "El proxy no está instalado. Ejecuta primero: sudo $0 install -e <email>"
+  docker network inspect "${NETWORK_NAME}" &>/dev/null || die "La red '${NETWORK_NAME}' no existe."
+
+  if [[ -z "$LE_EMAIL" ]]; then
+    if [[ -f "${BASE_DIR}/.state/default_email" ]]; then
+      LE_EMAIL="$(cat "${BASE_DIR}/.state/default_email")"
+    else
+      die "No se indicó -m <email> y no hay email por defecto guardado."
+    fi
+  fi
+
+  local _domain_regex='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
+  [[ "$DOMAIN" =~ $_domain_regex ]] || die "El dominio '${DOMAIN}' no tiene un formato válido."
+
+  local APP_ID
+  APP_ID="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
+  [[ -z "$APP_ID" ]] && die "El nombre de app resultó vacío tras sanitizar."
+
+  if [[ -n "$(state_get "$APP_ID")" ]]; then
+    die "Ya existe una app/registro con el id '${APP_ID}'. Usa 'remove' primero o elige otro nombre."
+  fi
+
+  local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
+  mkdir -p "$APP_DIR"
+
+  # Configuración nginx minimalista: responde 301 a cualquier ruta
+  cat > "${APP_DIR}/redirect.conf" <<EOF
+server {
+    listen 80;
+    server_name _;
+    return 301 ${TARGET_URL}\$request_uri;
+}
+EOF
+
+  cat > "${APP_DIR}/docker-compose.yml" <<EOF
+services:
+  ${APP_ID}:
+    image: nginx:alpine
+    container_name: ${APP_ID}
+    restart: unless-stopped
+    networks:
+      - ${NETWORK_NAME}
+    volumes:
+      - ./redirect.conf:/etc/nginx/conf.d/default.conf:ro
+    environment:
+      - VIRTUAL_HOST=${DOMAIN}
+      - VIRTUAL_PORT=80
+      - LETSENCRYPT_HOST=${DOMAIN}
+      - LETSENCRYPT_EMAIL=${LE_EMAIL}
+
+networks:
+  ${NETWORK_NAME}:
+    external: true
+EOF
+
+  log_info "Levantando redirector '${APP_ID}' (${DOMAIN} -> ${TARGET_URL})..."
+  (cd "$APP_DIR" && docker compose up -d)
+  state_add "$APP_ID" "$DOMAIN" "80" "redirect" "$TARGET_URL" "-"
+
+  log_ok "Listo. Todo el tráfico a '${DOMAIN}' será redirigido (301) a '${TARGET_URL}'."
+  echo "El certificado SSL para '${DOMAIN}' se emite automáticamente en 30-90 segundos."
 }
 
 # ============================================================================
@@ -640,6 +753,7 @@ case "$COMMAND" in
   logs)      cmd_logs "$@" ;;
   certs)     cmd_certs "$@" ;;
   renew)     cmd_renew "$@" ;;
+  redirect)  cmd_redirect "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   help|-h|--help) print_main_usage ;;
   *) log_err "Comando desconocido: '$COMMAND'"; echo; print_main_usage; exit 1 ;;
