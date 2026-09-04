@@ -53,7 +53,8 @@ print_main_usage() {
 reverse-proxy.sh — Administrador de Proxy Inverso NGINX sobre Docker
 
 USO:
-  sudo $0 <comando> [opciones]
+  sudo $0                    Modo interactivo: te pregunta todo paso a paso (recomendado)
+  sudo $0 <comando> [opciones]   Modo directo, para scripts/automatización
 
 COMANDOS:
   install     Instala Docker (si falta), la red compartida y el proxy (nginx-proxy + acme-companion)
@@ -738,9 +739,136 @@ cmd_uninstall() {
 }
 
 # ============================================================================
+# MODO INTERACTIVO — menú que pregunta cada dato y ejecuta la acción
+# ============================================================================
+_pause() { read -rp "Presiona Enter para continuar..." _ ; }
+
+_run_safe() {
+  # Ejecuta la función indicada en un subshell: si algo falla (die/exit),
+  # NO se cierra el script completo, solo se reporta el error y se vuelve al menú.
+  ( "$@" )
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log_warn "La operación terminó con errores (código $rc)."
+  fi
+  return 0
+}
+
+interactive_menu() {
+  while true; do
+    echo
+    echo "================================================================"
+    echo "   Administrador de Reverse Proxy NGINX + Docker"
+    echo "================================================================"
+    echo "  1) Instalar el proxy (primera vez)"
+    echo "  2) Agregar dominio/subdominio (nuevo contenedor o existente)"
+    echo "  3) Crear una redirección (dominio -> URL)"
+    echo "  4) Listar apps/dominios publicados"
+    echo "  5) Ver estado de los contenedores"
+    echo "  6) Ver logs (proxy, acme o una app)"
+    echo "  7) Ver estado de certificados SSL"
+    echo "  8) Forzar renovación de certificado(s)"
+    echo "  9) Eliminar una app/redirección"
+    echo " 10) Desinstalar el proxy"
+    echo "  0) Salir"
+    echo "----------------------------------------------------------------"
+    read -rp "Elige una opción: " OPT
+    echo
+
+    case "$OPT" in
+      1)
+        read -rp "Email para Let's Encrypt (obligatorio): " EMAIL
+        [[ -z "$EMAIL" ]] && { log_warn "El email es obligatorio."; _pause; continue; }
+        read -rp "Directorio base [Enter = ${BASE_DIR}]: " BDIR
+        ARGS=(-e "$EMAIL"); [[ -n "$BDIR" ]] && ARGS+=(-b "$BDIR")
+        _run_safe cmd_install "${ARGS[@]}"
+        ;;
+
+      2)
+        read -rp "Nombre corto de la app (ej: blog, api): " APP_N
+        read -rp "Dominio/subdominio principal (ej: blog.midominio.com): " DOM
+        read -rp "Puerto interno del contenedor (ej: 80, 3000): " PRT
+        read -rp "Email Let's Encrypt [Enter = usar el de install]: " MAIL
+        read -rp "Alias adicionales separados por coma [Enter = ninguno]: " ALIAS
+        echo "¿El backend es...?"
+        echo "  a) Un contenedor NUEVO (a partir de una imagen)"
+        echo "  b) Un contenedor YA EXISTENTE"
+        read -rp "Elige a/b: " TIPO_SEL
+
+        ARGS=(-n "$APP_N" -H "$DOM" -p "$PRT")
+        [[ -n "$MAIL"  ]] && ARGS+=(-m "$MAIL")
+        [[ -n "$ALIAS" ]] && ARGS+=(-a "$ALIAS")
+
+        if [[ "$TIPO_SEL" == "a" ]]; then
+          read -rp "Imagen Docker (ej: wordpress:latest): " IMG
+          ARGS+=(-i "$IMG")
+        elif [[ "$TIPO_SEL" == "b" ]]; then
+          read -rp "Nombre del contenedor existente: " CONT
+          ARGS+=(-c "$CONT")
+        else
+          log_warn "Opción inválida."; _pause; continue
+        fi
+        _run_safe cmd_add "${ARGS[@]}"
+        ;;
+
+      3)
+        read -rp "Nombre corto de la redirección (ej: old-blog): " APP_N
+        read -rp "Dominio de origen (ej: viejo.midominio.com): " DOM
+        read -rp "URL destino completa (ej: https://nuevo.midominio.com): " DEST
+        read -rp "Email Let's Encrypt [Enter = usar el de install]: " MAIL
+        ARGS=(-n "$APP_N" -H "$DOM" -t "$DEST")
+        [[ -n "$MAIL" ]] && ARGS+=(-m "$MAIL")
+        _run_safe cmd_redirect "${ARGS[@]}"
+        ;;
+
+      4) _run_safe cmd_list ;;
+
+      5) _run_safe cmd_status ;;
+
+      6)
+        read -rp "¿Logs de qué? [proxy/acme/<id-de-app>] (Enter = proxy): " TARGET
+        ARGS=(); [[ -n "$TARGET" ]] && ARGS+=(-n "$TARGET")
+        echo "(Ctrl+C para dejar de ver los logs y volver al menú)"
+        _run_safe cmd_logs "${ARGS[@]}"
+        ;;
+
+      7)
+        read -rp "¿Certificado de qué app? [Enter = todos]: " TARGET
+        ARGS=(); [[ -n "$TARGET" ]] && ARGS+=(-n "$TARGET")
+        _run_safe cmd_certs "${ARGS[@]}"
+        ;;
+
+      8)
+        read -rp "¿Renovar cuál app? (o escribe 'all' para todas): " TARGET
+        [[ -z "$TARGET" ]] && { log_warn "Debes indicar una app o 'all'."; _pause; continue; }
+        _run_safe cmd_renew -n "$TARGET"
+        ;;
+
+      9)
+        read -rp "Id de la app/redirección a eliminar: " APP_N
+        [[ -z "$APP_N" ]] && { log_warn "Debes indicar un id."; _pause; continue; }
+        read -rp "¿Confirmas eliminar '${APP_N}'? [y/N]: " CONF
+        [[ "$CONF" =~ ^[Yy]$ ]] || { log_info "Cancelado."; _pause; continue; }
+        _run_safe cmd_remove -n "$APP_N"
+        ;;
+
+      10) _run_safe cmd_uninstall ;;
+
+      0) log_info "Hasta luego."; exit 0 ;;
+
+      *) log_warn "Opción no reconocida." ;;
+    esac
+    _pause
+  done
+}
+
+# ============================================================================
 # DISPATCH PRINCIPAL
 # ============================================================================
-[[ $# -lt 1 ]] && { print_main_usage; exit 1; }
+if [[ $# -lt 1 ]]; then
+  interactive_menu
+  exit 0
+fi
 
 COMMAND="$1"; shift
 
