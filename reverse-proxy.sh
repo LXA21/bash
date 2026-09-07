@@ -30,8 +30,6 @@ IFS=$'\n\t'
 BASE_DIR="/opt/reverse-proxy"
 NETWORK_NAME="proxy"
 STATE_FILE="${BASE_DIR}/.state/apps.tsv"   # registro de apps: id<TAB>dominio<TAB>puerto<TAB>tipo
-DOMAIN_STATE_FILE="${BASE_DIR}/.state/domains.tsv"   # zonas: raiz<TAB>proveedor<TAB>api_dns<TAB>id_config
-ACME_USER_DATA="${BASE_DIR}/.state/letsencrypt_user_data"
 
 # ============================================================================
 # UTILIDADES DE SALIDA / LOG
@@ -66,8 +64,8 @@ COMANDOS:
   list        Lista las apps/dominios actualmente publicados
   status      Muestra el estado de los contenedores del proxy y de las apps
   logs        Muestra logs del proxy, del emisor de certificados, o de una app
-  certs       Muestra el estado y fecha de vencimiento de los certificados wildcard por zona
-  renew       Fuerza la renovación de un certificado wildcard por zona (o de todos)
+  certs       Muestra el estado y fecha de vencimiento de los certificados SSL
+  renew       Fuerza la renovación de un certificado (o de todos)
   uninstall   Detiene y elimina completamente el proxy (no borra las apps)
   help        Muestra esta ayuda
 
@@ -114,268 +112,6 @@ state_get() {
   grep -P "^${1}\t" "$STATE_FILE" || true
 }
 
-
-# ============================================================================
-# GESTIÓN AUTOMÁTICA DE DOMINIOS / DNS / WILDCARD
-# ============================================================================
-ensure_domain_state_file() {
-  mkdir -p "$(dirname "$DOMAIN_STATE_FILE")"
-  [[ -f "$DOMAIN_STATE_FILE" ]] || touch "$DOMAIN_STATE_FILE"
-}
-
-shell_quote() {
-  printf "%q" "$1"
-}
-
-# Devuelve la zona DNS autoritativa más específica con SOA. Esto evita asumir
-# que el dominio raíz siempre son las últimas dos etiquetas (co.uk, com.au, etc.).
-detect_dns_zone() {
-  local host="$1"
-  host="${host%.}"
-  local labels=() candidate i out old_ifs="$IFS"
-  IFS='.' read -ra labels <<< "$host"
-  for ((i=0; i<${#labels[@]}; i++)); do
-    candidate="$(IFS='.'; printf '%s' "${labels[*]:i}")"
-    if command -v dig >/dev/null 2>&1; then
-      out="$(dig +short SOA "$candidate" 2>/dev/null || true)"
-      if [[ -n "$out" ]]; then
-        IFS="$old_ifs"
-        printf '%s' "$candidate"
-        return 0
-      fi
-    fi
-  done
-  IFS="$old_ifs"
-  return 1
-}
-
-ensure_dns_tools() {
-  if command -v dig >/dev/null 2>&1; then
-    return 0
-  fi
-  log_info "No se encontró 'dig'. Instalando la herramienta DNS necesaria para detectar automáticamente la zona/proveedor..."
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 && apt-get install -y dnsutils >/dev/null 2>&1 && return 0
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y bind-utils >/dev/null 2>&1 && return 0
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y bind-utils >/dev/null 2>&1 && return 0
-  fi
-  return 1
-}
-
-detect_dns_provider() {
-  local zone="$1" ns
-  ns="$(dig +short NS "$zone" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr '\n' ' ' || true)"
-  [[ -n "$ns" ]] || { printf '%s' "unknown"; return 0; }
-  case "$ns" in
-    *cloudflare.com*) printf '%s' "cloudflare" ;;
-    *dns-parking.com*|*hostinger.com*) printf '%s' "hostinger" ;;
-    *domaincontrol.com*) printf '%s' "godaddy" ;;
-    *registrar-servers.com*) printf '%s' "namecheap" ;;
-    *awsdns-*) printf '%s' "route53" ;;
-    *digitalocean.com*) printf '%s' "digitalocean" ;;
-    *linode.com*|*linodeobjects.com*) printf '%s' "linode" ;;
-    *hetzner.com*|*hetzner.de*) printf '%s' "hetznercloud" ;;
-    *dnsimple.com*) printf '%s' "dnsimple" ;;
-    *) printf '%s' "unknown" ;;
-  esac
-}
-
-domain_state_get() {
-  ensure_domain_state_file
-  awk -F '\t' -v zone="$1" '$1 == zone {print; exit}' "$DOMAIN_STATE_FILE" 2>/dev/null || true
-}
-
-domain_state_add() {
-  ensure_domain_state_file
-  local zone="$1" provider="$2" dns_api="$3" cfg_id="$4"
-  awk -F '\t' -v zone="$zone" '$1 != zone' "$DOMAIN_STATE_FILE" > "${DOMAIN_STATE_FILE}.tmp" 2>/dev/null || true
-  printf "%s\t%s\t%s\t%s\n" "$zone" "$provider" "$dns_api" "$cfg_id" >> "${DOMAIN_STATE_FILE}.tmp"
-  mv -f "${DOMAIN_STATE_FILE}.tmp" "$DOMAIN_STATE_FILE"
-}
-
-acme_cfg_escape() {
-  # %q produce una representación segura para Bash, incluyendo comillas,
-  # espacios, backslashes y caracteres especiales.
-  printf "%q" "$1"
-}
-
-write_acme_user_data() {
-  local zone="$1" provider="$2" dns_api="$3" email="$4" cfg_id="$5"
-  shift 5
-  local cfg_file="$ACME_USER_DATA"
-  local tmp="${cfg_file}.tmp"
-  ensure_domain_state_file
-  mkdir -p "$(dirname "$cfg_file")"
-  touch "$cfg_file"
-  chmod 600 "$cfg_file"
-
-  # Regenera el archivo completo desde domains.tsv + los bloques existentes.
-  # Para no guardar secretos en domains.tsv, los bloques de configuración ACME
-  # son conservados y el nuevo bloque se añade/actualiza por identificador.
-  if [[ -f "$cfg_file" ]] && grep -q "^ACME_${cfg_id}_HOST=" "$cfg_file"; then
-    return 0
-  fi
-
-  {
-    if [[ ! -s "$cfg_file" ]]; then
-      echo "# Generado automáticamente por reverse-proxy.sh. NO editar manualmente."
-      echo "ACME_STANDALONE_CERTS=()"
-    else
-      cat "$cfg_file"
-    fi
-    echo ""
-    echo "ACME_STANDALONE_CERTS+=("${cfg_id}")"
-    printf "ACME_%s_HOST=('%s' '*.%s')\n" "$cfg_id" "$zone" "$zone"
-    printf "ACME_%s_EMAIL=%s\n" "$cfg_id" "$(acme_cfg_escape "$email")"
-    echo "ACME_${cfg_id}_CHALLENGE='DNS-01'"
-    echo "declare -A ACMESH_${cfg_id}_DNS_API_CONFIG=("
-    printf "  ['DNS_API']='%s'\n" "$dns_api"
-    while (($#)); do
-      local key="$1" value="$2"
-      shift 2
-      printf "  ['%s']=%s\n" "$key" "$(acme_cfg_escape "$value")"
-    done
-    echo ")"
-  } > "$tmp"
-  mv -f "$tmp" "$cfg_file"
-  chmod 600 "$cfg_file"
-}
-
-setup_dns_credentials() {
-  # Salida: variables globales DNS_API_NAME y DNS_CFG_KV (pares key/value).
-  local zone="$1" detected="$2" provider="$2"
-  local v1 v2 v3
-  DNS_API_NAME=""
-  DNS_CFG_KV=()
-
-  if [[ "$provider" == "unknown" ]]; then
-    echo
-    log_warn "No pude identificar automáticamente el proveedor DNS de '${zone}'."
-    echo "Proveedores detectables actualmente: Hostinger, Cloudflare, GoDaddy, Namecheap, AWS Route53, DigitalOcean, Linode, Hetzner Cloud y DNSimple."
-    read -rp "Proveedor DNS [Enter = manual]: " provider
-    provider="$(echo "$provider" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
-    [[ -z "$provider" ]] && provider="manual"
-  fi
-
-  case "$provider" in
-    hostinger)
-      DNS_API_NAME="dns_hostinger"
-      if [[ -n "${HOSTINGER_Token:-}" ]]; then v1="$HOSTINGER_Token"; else read -rsp "Token API de Hostinger (solo la primera vez): " v1; echo; fi
-      [[ -n "$v1" ]] || die "El token de Hostinger es obligatorio para DNS-01 automático."
-      DNS_CFG_KV=(HOSTINGER_Token "$v1")
-      ;;
-    cloudflare)
-      DNS_API_NAME="dns_cf"
-      if [[ -n "${CF_Token:-}" ]]; then v1="$CF_Token"; else read -rsp "Token API de Cloudflare (solo la primera vez): " v1; echo; fi
-      [[ -n "$v1" ]] || die "El token de Cloudflare es obligatorio para DNS-01 automático."
-      DNS_CFG_KV=(CF_Token "$v1")
-      ;;
-    godaddy)
-      DNS_API_NAME="dns_gd"
-      read -rp "API Key de GoDaddy (solo la primera vez): " v1
-      read -rsp "API Secret de GoDaddy (solo la primera vez): " v2; echo
-      [[ -n "$v1" && -n "$v2" ]] || die "La API Key y el Secret de GoDaddy son obligatorios."
-      DNS_CFG_KV=(GD_Key "$v1" GD_Secret "$v2")
-      ;;
-    namecheap)
-      DNS_API_NAME="dns_namecheap"
-      read -rp "Username de Namecheap (solo la primera vez): " v1
-      read -rsp "API Key de Namecheap (solo la primera vez): " v2; echo
-      read -rp "IP pública autorizada en Namecheap (Enter = detectar): " v3
-      if [[ -z "$v3" ]]; then v3="$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"; fi
-      [[ -n "$v1" && -n "$v2" && -n "$v3" ]] || die "Namecheap requiere username, API key e IP origen."
-      DNS_CFG_KV=(NAMECHEAP_USERNAME "$v1" NAMECHEAP_API_KEY "$v2" NAMECHEAP_SOURCEIP "$v3")
-      ;;
-    route53)
-      DNS_API_NAME="dns_aws"
-      read -rp "AWS Access Key ID (Enter = usar IAM Role): " v1
-      if [[ -n "$v1" ]]; then
-        read -rsp "AWS Secret Access Key: " v2; echo
-        [[ -n "$v2" ]] || die "El AWS Secret Access Key es obligatorio."
-        DNS_CFG_KV=(AWS_ACCESS_KEY_ID "$v1" AWS_SECRET_ACCESS_KEY "$v2")
-      else
-        DNS_CFG_KV=()
-      fi
-      ;;
-    digitalocean)
-      DNS_API_NAME="dns_dgon"
-      read -rsp "Token API de DigitalOcean (solo la primera vez): " v1; echo
-      [[ -n "$v1" ]] || die "El token de DigitalOcean es obligatorio."
-      DNS_CFG_KV=(DO_API_KEY "$v1")
-      ;;
-    linode)
-      DNS_API_NAME="dns_linode"
-      read -rsp "API Key de Linode (solo la primera vez): " v1; echo
-      [[ -n "$v1" ]] || die "La API Key de Linode es obligatoria."
-      DNS_CFG_KV=(LINODE_API_KEY "$v1" DNS_SLEEP "900")
-      ;;
-    hetznercloud)
-      DNS_API_NAME="dns_hetznercloud"
-      read -rsp "Token DNS de Hetzner Cloud (solo la primera vez): " v1; echo
-      [[ -n "$v1" ]] || die "El token de Hetzner Cloud es obligatorio."
-      DNS_CFG_KV=(HETZNER_TOKEN "$v1")
-      ;;
-    dnsimple)
-      DNS_API_NAME="dns_dnsimple"
-      read -rsp "OAuth Token de DNSimple (solo la primera vez): " v1; echo
-      [[ -n "$v1" ]] || die "El token de DNSimple es obligatorio."
-      DNS_CFG_KV=(DNSimple_OAUTH_TOKEN "$v1")
-      ;;
-    manual)
-      die "El modo DNS manual no está habilitado en esta versión porque no permite renovación totalmente desatendida. Configura un proveedor con API compatible."
-      ;;
-    *)
-      die "Proveedor DNS '${provider}' no soportado automáticamente todavía. Configura un proveedor con API compatible o añade su adaptador DNS."
-      ;;
-  esac
-  DNS_PROVIDER="$provider"
-}
-
-ensure_wildcard_domain() {
-  local host="$1" email="$2"
-  ensure_domain_state_file
-  mkdir -p "${BASE_DIR}/.state"
-  ensure_dns_tools || die "No se pudo instalar 'dig'; no puedo detectar automáticamente la zona DNS."
-
-  local zone record provider dns_api cfg_id
-  DETECTED_DNS_ZONE=""
-  zone="$(detect_dns_zone "$host" || true)"
-  if [[ -z "$zone" ]]; then
-    # Si el host ya es un dominio raíz, lo aceptamos como fallback.
-    if [[ "$host" != *.*.* ]]; then
-      zone="$host"
-    else
-      die "No pude detectar la zona DNS de '${host}'. Verifica que el DNS esté publicado o configura la zona manualmente."
-    fi
-  fi
-
-  record="$(domain_state_get "$zone")"
-  if [[ -n "$record" ]]; then
-    log_ok "Zona DNS detectada automáticamente: ${zone}. Ya existe configuración; no se volverán a pedir credenciales."
-    DETECTED_DNS_ZONE="$zone"
-    return 0
-  fi
-
-  provider="$(detect_dns_provider "$zone")"
-  log_info "Nueva zona detectada: ${zone}"
-  log_info "Proveedor DNS detectado: ${provider}"
-
-  setup_dns_credentials "$zone" "$provider"
-  cfg_id="zone_$(echo "$zone" | tr -cd 'a-zA-Z0-9' | tr '[:upper:]' '[:lower:]')"
-  write_acme_user_data "$zone" "$DNS_PROVIDER" "$DNS_API_NAME" "$email" "$cfg_id" "${DNS_CFG_KV[@]}"
-  domain_state_add "$zone" "$DNS_PROVIDER" "$DNS_API_NAME" "$cfg_id"
-
-  # El archivo de configuración es leído por acme-companion al iniciar y al
-  # recibir signal_le_service.
-  if docker inspect nginx-proxy-acme >/dev/null 2>&1; then
-    docker exec nginx-proxy-acme signal_le_service >/dev/null 2>&1 || true
-  fi
-
-  DETECTED_DNS_ZONE="$zone"
-}
-
 # ============================================================================
 # LIMPIEZA COMPLETA DE UN DOMINIO / ALIASES
 # ============================================================================
@@ -411,17 +147,28 @@ cleanup_domain_artifacts() {
 
     log_info "Limpiando certificados y configuración de '${d}'..."
 
-    # Los certificados ahora pertenecen a la ZONA wildcard, no a la app.
-    # Nunca eliminamos aquí *.zona ni el estado global de acme.sh al quitar
-    # una publicación, porque otras apps/subdominios pueden estar usando
-    # exactamente el mismo wildcard.
+    # Certificados/cadenas/llaves que pertenecen exactamente a este host.
+    rm -f \
+      "${BASE_DIR}/nginx/certs/${d}.crt" \
+      "${BASE_DIR}/nginx/certs/${d}.key" \
+      "${BASE_DIR}/nginx/certs/${d}.chain.pem" \
+      "${BASE_DIR}/nginx/certs/${d}.fullchain.pem" \
+      "${BASE_DIR}/nginx/certs/${d}.dhparam.pem" 2>/dev/null || true
 
     # Configuración personalizada por host de nginx-proxy, si existe.
     rm -f \
       "${BASE_DIR}/nginx/vhost.d/${d}" \
       "${BASE_DIR}/nginx/vhost.d/${d}.conf" 2>/dev/null || true
 
-    # El estado ACME/wildcard se conserva aunque se elimine esta app.
+    # Estado específico de ACME para este dominio. No se toca la cuenta
+    # global de Let's Encrypt ni los certificados de otros dominios.
+    if docker inspect nginx-proxy-acme &>/dev/null; then
+      docker exec nginx-proxy-acme acme.sh --remove -d "$d" &>/dev/null || true
+      docker exec nginx-proxy-acme sh -c \
+        'rm -rf -- "$1" "$2"' sh \
+        "/etc/acme.sh/${d}" \
+        "/etc/acme.sh/${d}_ecc" 2>/dev/null || true
+    fi
   done
 
   # Fuerza a nginx-proxy a recargar la configuración después de eliminar
@@ -498,12 +245,9 @@ EOF
 
   # ---- Estructura de directorios ----
   log_info "Creando estructura de directorios en ${BASE_DIR}..."
-  mkdir -p "${BASE_DIR}/nginx/certs" "${BASE_DIR}/nginx/vhost.d" "${BASE_DIR}/nginx/conf.d" \
+  mkdir -p "${BASE_DIR}/nginx/certs" "${BASE_DIR}/nginx/vhost.d" \
            "${BASE_DIR}/nginx/html" "${BASE_DIR}/nginx/acme" \
            "${BASE_DIR}/apps" "${BASE_DIR}/.state"
-  ensure_domain_state_file
-  touch "${ACME_USER_DATA}"
-  chmod 600 "${ACME_USER_DATA}"
   ensure_state_file
   echo "$LE_EMAIL" > "${BASE_DIR}/.state/default_email"
 
@@ -516,7 +260,7 @@ EOF
   fi
 
   # ---- docker-compose.yml del proxy ----
-  log_info "Generando docker-compose.yml de nginx-proxy + acme-companion (wildcard DNS-01)..."
+  log_info "Generando docker-compose.yml de nginx-proxy + acme-companion..."
   cat > "${BASE_DIR}/docker-compose.yml" <<EOF
 services:
   nginx-proxy:
@@ -532,7 +276,6 @@ services:
       - /var/run/docker.sock:/tmp/docker.sock:ro
       - ./nginx/certs:/etc/nginx/certs:ro
       - ./nginx/vhost.d:/etc/nginx/vhost.d
-      - ./nginx/conf.d:/etc/nginx/conf.d
       - ./nginx/html:/usr/share/nginx/html
     labels:
       - "com.github.nginx-proxy.nginx-proxy=true"
@@ -547,10 +290,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./nginx/certs:/etc/nginx/certs
       - ./nginx/vhost.d:/etc/nginx/vhost.d
-      - ./nginx/conf.d:/etc/nginx/conf.d
       - ./nginx/html:/usr/share/nginx/html
       - ./nginx/acme:/etc/acme.sh
-      - ./.state/letsencrypt_user_data:/app/letsencrypt_user_data:ro
     environment:
       - DEFAULT_EMAIL=${LE_EMAIL}
       - NGINX_PROXY_CONTAINER=nginx-proxy
@@ -631,10 +372,6 @@ EOF
   [[ "$DOMAIN" =~ $_domain_regex ]] || die "El dominio '${DOMAIN}' no tiene un formato válido."
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "El puerto '${PORT}' debe ser numérico."
 
-  # La primera vez que aparece una zona, el script detectará automáticamente
-  # la zona y el proveedor DNS y preparará su wildcard. La detección se hace
-  # después de validar el id de la app para no pedir credenciales si la app ya existe.
-  local DNS_ZONE=""
   local ALL_HOSTS="$DOMAIN"
   if [[ -n "$ALIASES" ]]; then
     IFS=',' read -ra _alias_arr <<< "$ALIASES"
@@ -652,18 +389,6 @@ EOF
 
   if [[ -n "$(state_get "$APP_ID")" ]]; then
     die "Ya existe una app registrada con el id '${APP_ID}'. Usa 'remove' primero o elige otro nombre (-n)."
-  fi
-
-  # Primera vez por zona: detección DNS + credenciales una sola vez.
-  ensure_wildcard_domain "$DOMAIN" "$LE_EMAIL"
-  DNS_ZONE="$DETECTED_DNS_ZONE"
-  if [[ -n "$ALIASES" ]]; then
-    IFS=',' read -ra _alias_arr <<< "$ALIASES"
-    for a in "${_alias_arr[@]}"; do
-      a="$(echo "$a" | xargs)"
-      [[ -z "$a" ]] && continue
-      ensure_wildcard_domain "$a" "$LE_EMAIL"
-    done
   fi
 
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
@@ -720,6 +445,8 @@ services:
     environment:
       - VIRTUAL_HOST=${ALL_HOSTS}
       - VIRTUAL_PORT=80
+      - LETSENCRYPT_HOST=${ALL_HOSTS}
+      - LETSENCRYPT_EMAIL=${LE_EMAIL}
 
 networks:
   ${NETWORK_NAME}:
@@ -735,7 +462,7 @@ EOF
     log_ok "El tráfico externo 80/443 será reenviado internamente a '${EXISTING_CONTAINER}:${PORT}'."
     echo "URL pública: https://${DOMAIN}/"
     echo "El contenedor original NO fue recreado ni eliminado."
-    echo "SSL: wildcard de la zona ${DNS_ZONE} (${DNS_ZONE} + *.${DNS_ZONE})."
+    echo "El certificado SSL será gestionado automáticamente por acme-companion."
     return 0
   fi
 
@@ -751,6 +478,8 @@ services:
     environment:
       - VIRTUAL_HOST=${ALL_HOSTS}
       - VIRTUAL_PORT=${PORT}
+      - LETSENCRYPT_HOST=${ALL_HOSTS}
+      - LETSENCRYPT_EMAIL=${LE_EMAIL}
 
 networks:
   ${NETWORK_NAME}:
@@ -762,9 +491,9 @@ EOF
   state_add "$APP_ID" "$DOMAIN" "$PORT" "nuevo" "$IMAGE" "${ALIASES:--}"
 
   log_ok "Listo. '${ALL_HOSTS}' quedará enrutado hacia '${APP_ID}:${PORT}'."
-  echo "SSL: wildcard de la zona ${DNS_ZONE} (${DNS_ZONE} + *.${DNS_ZONE})."
-  echo "acme-companion gestionará automáticamente la emisión/renovación mediante DNS-01."
-  echo "Verifica con: sudo $0 certs -n ${APP_ID}   |   sudo $0 logs -n acme"
+  echo "El certificado SSL se emite automáticamente en 30-90 segundos y"
+  echo "acme-companion lo renovará solo, sin intervención, ~30 días antes de vencer."
+  echo "Verifica con: sudo $0 certs -n ${APP_ID}   |   sudo $0 logs -n ${APP_ID}"
 }
 
 # ============================================================================
@@ -926,87 +655,61 @@ cmd_certs() {
       n) TARGET="$OPTARG" ;;
       h) cat <<EOF
 Uso: sudo $0 certs [-n <app>|all]
-  -n   id de una app publicada, o 'all' (default) para ver los certificados wildcard
+  -n   id de una app publicada, o 'all' (default) para ver todos los certificados emitidos
 EOF
          exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
-      :) die "La opción -$OPTARG requiere un argumento." ;;
+      :)  die "La opción -$OPTARG requiere un argumento." ;;
     esac
   done
 
   [[ -d "${BASE_DIR}/nginx/certs" ]] || die "El proxy no está instalado (no existe ${BASE_DIR}/nginx/certs)."
   ensure_state_file
-  ensure_domain_state_file
 
   _print_cert_row() {
     local domain="$1"
     local crt="${BASE_DIR}/nginx/certs/${domain}.crt"
     if [[ ! -f "$crt" ]]; then
-      local candidate sans_candidate
-      for candidate in "${BASE_DIR}/nginx/certs/"*.crt; do
-        [[ -f "$candidate" ]] || continue
-        sans_candidate="$(openssl x509 -in "$candidate" -noout -ext subjectAltName 2>/dev/null | tr '\n' ' ' || true)"
-        if [[ "$sans_candidate" == *"DNS:${domain}"* && "$sans_candidate" == *"DNS:*.${domain}"* ]]; then
-          crt="$candidate"
-          break
-        fi
-      done
-    fi
-    if [[ ! -f "$crt" ]]; then
-      printf "  %-35s %s\n" "$domain" "certificado wildcard no encontrado (¿aún emitiéndose o falló?)"
+      printf "  %-35s %s\n" "$domain" "certificado no encontrado (¿aún emitiéndose o falló?)"
       return
     fi
     local end_date days_left
     end_date="$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)"
-    [[ -n "$end_date" ]] || { printf "  %-35s %s\n" "$domain" "no se pudo leer el certificado"; return; }
+    if [[ -z "$end_date" ]]; then
+      printf "  %-35s %s\n" "$domain" "no se pudo leer el certificado"
+      return
+    fi
     local end_epoch now_epoch
     end_epoch="$(date -d "$end_date" +%s 2>/dev/null || echo 0)"
     now_epoch="$(date +%s)"
     days_left=$(( (end_epoch - now_epoch) / 86400 ))
-    if (( days_left < 0 )); then
-      printf "  %-35s VENCIDO (%s)\n" "$domain" "$end_date"
-    elif (( days_left < 15 )); then
-      printf "  %-35s ${C_WARN}vence en %s días${C_RESET} (%s)\n" "$domain" "$days_left" "$end_date"
-    else
-      printf "  %-35s ${C_OK}vence en %s días${C_RESET} (%s)\n" "$domain" "$days_left" "$end_date"
+    if   (( days_left < 0 ));  then printf "  %-35s VENCIDO (%s)\n" "$domain" "$end_date"
+    elif (( days_left < 15 )); then printf "  %-35s ${C_WARN}vence en %s días${C_RESET} (%s)\n" "$domain" "$days_left" "$end_date"
+    else                            printf "  %-35s ${C_OK}vence en %s días${C_RESET} (%s)\n" "$domain" "$days_left" "$end_date"
     fi
-    local sans
-    sans="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null | tr '\n' ' ' || true)"
-    [[ "$sans" == *"*.$domain"* ]] && echo "    SAN: ${domain}, *.${domain}" || true
   }
 
   if [[ "$TARGET" == "all" ]]; then
-    log_info "Estado de certificados wildcard:"
-    if [[ ! -s "$DOMAIN_STATE_FILE" ]]; then
-      log_info "No hay zonas DNS configuradas todavía."
+    if [[ ! -s "$STATE_FILE" ]]; then
+      log_info "No hay apps publicadas todavía."
       return 0
     fi
-    while IFS=$'\t' read -r zone provider dns_api cfg_id; do
-      [[ -z "$zone" ]] && continue
-      _print_cert_row "$zone"
-      printf "    DNS: %s (%s)\n" "$provider" "$dns_api"
-    done < "$DOMAIN_STATE_FILE"
+    log_info "Estado de certificados:"
+    while IFS=$'\t' read -r id domain port tipo ref aliases; do
+      _print_cert_row "$domain"
+    done < "$STATE_FILE"
   else
-    local record zone provider dns_api cfg_id host appid
-    record="$(domain_state_get "$TARGET")"
-    if [[ -z "$record" ]]; then
-      appid="$(echo "$TARGET" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
-      record="$(state_get "$appid")"
-      [[ -n "$record" ]] || die "No existe la zona '${TARGET}' ni la app '${appid}'."
-      host="$(echo "$record" | cut -f2)"
-      zone="$(detect_dns_zone "$host" || true)"
-      [[ -n "$zone" ]] || die "No pude determinar la zona DNS de '${host}'."
-      record="$(domain_state_get "$zone")"
-    fi
-    IFS=$'\t' read -r zone provider dns_api cfg_id <<< "$record"
-    log_info "Estado del wildcard para '${zone}':"
-    _print_cert_row "$zone"
-    printf "    DNS: %s (%s)\n" "$provider" "$dns_api"
+    local APP_ID; APP_ID="$(echo "${TARGET}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
+    local RECORD; RECORD="$(state_get "$APP_ID")"
+    [[ -z "$RECORD" ]] && die "No hay app '${APP_ID}' registrada. Usa: $0 list"
+    local domain; domain="$(echo "$RECORD" | cut -f2)"
+    log_info "Estado de certificado para '${APP_ID}' (${domain}):"
+    _print_cert_row "$domain"
   fi
 }
 
 # ============================================================================
-# COMANDO: renew — fuerza renovación del wildcard de una zona DNS
+# COMANDO: renew — fuerza renovación de certificados vía acme-companion
 # ============================================================================
 cmd_renew() {
   local TARGET=""
@@ -1015,53 +718,51 @@ cmd_renew() {
     case "$opt" in
       n) TARGET="$OPTARG" ;;
       h) cat <<EOF
-Uso: sudo $0 renew -n <zona>|all
-  -n   dominio raíz (ej: orkapp.online), id de app que pertenezca a esa zona, o 'all'
+Uso: sudo $0 renew -n <app>|all
+  -n   id de una app publicada, o 'all' para forzar la renovación de TODOS los certificados
 EOF
          exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
-      :) die "La opción -$OPTARG requiere un argumento." ;;
+      :)  die "La opción -$OPTARG requiere un argumento." ;;
     esac
   done
-  [[ -n "$TARGET" ]] || die "Falta -n <zona>|<app>|all. Usa: $0 renew -h"
+  [[ -z "$TARGET" ]] && die "Falta -n <app>|all. Usa: $0 renew -h"
   require_root
-  docker inspect nginx-proxy-acme &>/dev/null || die "El contenedor 'nginx-proxy-acme' no está corriendo. ¿Instalaste el proxy?"
-  ensure_domain_state_file
 
-  renew_zone() {
-    local zone="$1"
-    [[ -n "$(domain_state_get "$zone")" ]] || { log_warn "No existe una configuración wildcard para '${zone}'."; return 1; }
-    log_info "Forzando renovación del wildcard '${zone} + *.${zone}'..."
-    local logfile="/tmp/renew_${zone//[^a-zA-Z0-9_.-]/_}.log"
-    if docker exec nginx-proxy-acme acme.sh --renew -d "$zone" --force &>"$logfile"; then
-      log_ok "Renovación completada para '${zone} + *.${zone}'."
+  docker inspect nginx-proxy-acme &>/dev/null || die "El contenedor 'nginx-proxy-acme' no está corriendo. ¿Instalaste el proxy?"
+  ensure_state_file
+
+  _force_renew_domain() {
+    local domain="$1"
+    log_info "Forzando renovación de '${domain}'..."
+    if docker exec nginx-proxy-acme acme.sh --renew -d "$domain" --force &>/tmp/renew_${domain//\//_}.log; then
+      log_ok "Renovación completada para '${domain}'."
     else
-      log_warn "acme.sh reportó un problema renovando '${zone}'. Detalle:"
-      tail -n 20 "$logfile" || true
-      return 1
+      log_warn "acme.sh reportó un problema renovando '${domain}'. Detalle:"
+      tail -n 15 "/tmp/renew_${domain//\//_}.log" || true
     fi
   }
 
   if [[ "$TARGET" == "all" ]]; then
-    while IFS=$'\t' read -r zone provider dns_api cfg_id; do
-      [[ -z "$zone" ]] && continue
-      renew_zone "$zone" || true
-    done < "$DOMAIN_STATE_FILE"
-  else
-    local zone="$TARGET" record appid
-    record="$(domain_state_get "$zone")"
-    if [[ -z "$record" ]]; then
-      appid="$(echo "$TARGET" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
-      record="$(state_get "$appid")"
-      [[ -n "$record" ]] || die "No existe la zona '${TARGET}' ni la app '${appid}'."
-      local host; host="$(echo "$record" | cut -f2)"
-      zone="$(detect_dns_zone "$host" || true)"
-      [[ -n "$zone" ]] || die "No pude determinar la zona DNS de '${host}'."
+    if [[ ! -s "$STATE_FILE" ]]; then
+      log_info "No hay apps publicadas todavía."
+      return 0
     fi
-    renew_zone "$zone"
+    while IFS=$'\t' read -r id domain port tipo ref aliases; do
+      _force_renew_domain "$domain"
+    done < "$STATE_FILE"
+  else
+    local APP_ID; APP_ID="$(echo "${TARGET}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
+    local RECORD; RECORD="$(state_get "$APP_ID")"
+    [[ -z "$RECORD" ]] && die "No hay app '${APP_ID}' registrada. Usa: $0 list"
+    local domain; domain="$(echo "$RECORD" | cut -f2)"
+    _force_renew_domain "$domain"
   fi
 
-  docker exec nginx-proxy nginx -s reload >/dev/null 2>&1 || true
+  log_info "Recargando nginx-proxy para aplicar los certificados renovados..."
+  docker exec nginx-proxy nginx -s reload 2>/dev/null \
+    && log_ok "nginx-proxy recargado." \
+    || log_warn "No se pudo recargar nginx-proxy automáticamente; normalmente detecta el cambio solo."
 }
 
 # ============================================================================
@@ -1112,10 +813,6 @@ EOF
   local _domain_regex='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
   [[ "$DOMAIN" =~ $_domain_regex ]] || die "El dominio '${DOMAIN}' no tiene un formato válido."
 
-  local DNS_ZONE
-  ensure_wildcard_domain "$DOMAIN" "$LE_EMAIL"
-  DNS_ZONE="$DETECTED_DNS_ZONE"
-
   local APP_ID
   APP_ID="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
   [[ -z "$APP_ID" ]] && die "El nombre de app resultó vacío tras sanitizar."
@@ -1149,6 +846,8 @@ services:
     environment:
       - VIRTUAL_HOST=${DOMAIN}
       - VIRTUAL_PORT=80
+      - LETSENCRYPT_HOST=${DOMAIN}
+      - LETSENCRYPT_EMAIL=${LE_EMAIL}
 
 networks:
   ${NETWORK_NAME}:
@@ -1160,7 +859,7 @@ EOF
   state_add "$APP_ID" "$DOMAIN" "80" "redirect" "$TARGET_URL" "-"
 
   log_ok "Listo. Todo el tráfico a '${DOMAIN}' será redirigido (301) a '${TARGET_URL}'."
-  echo "SSL: wildcard de la zona correspondiente; la emisión/renovación se gestiona automáticamente."
+  echo "El certificado SSL para '${DOMAIN}' se emite automáticamente en 30-90 segundos."
 }
 
 # ============================================================================
@@ -1206,7 +905,7 @@ interactive_menu() {
     echo "  5) Ver estado de los contenedores"
     echo "  6) Ver logs (proxy, acme o una app)"
     echo "  7) Ver estado de certificados SSL"
-    echo "  8) Forzar renovación de certificado wildcard"
+    echo "  8) Forzar renovación de certificado(s)"
     echo "  9) Eliminar una app/redirección"
     echo " 10) Desinstalar el proxy"
     echo "  0) Salir"
@@ -1272,18 +971,15 @@ interactive_menu() {
         ;;
 
       7)
-        read -rp "¿Certificado de qué zona/app? [Enter = todos]: " TARGET
+        read -rp "¿Certificado de qué app? [Enter = todos]: " TARGET
         ARGS=(); [[ -n "$TARGET" ]] && ARGS+=(-n "$TARGET")
         _run_safe cmd_certs "${ARGS[@]}"
         ;;
 
       8)
-        read -rp "¿Renovar qué zona/app? (Enter = todas): " TARGET
-        if [[ -z "$TARGET" ]]; then
-          _run_safe cmd_renew -n all
-        else
-          _run_safe cmd_renew -n "$TARGET"
-        fi
+        read -rp "¿Renovar cuál app? (o escribe 'all' para todas): " TARGET
+        [[ -z "$TARGET" ]] && { log_warn "Debes indicar una app o 'all'."; _pause; continue; }
+        _run_safe cmd_renew -n "$TARGET"
         ;;
 
       9)
