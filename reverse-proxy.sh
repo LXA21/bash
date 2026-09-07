@@ -250,173 +250,99 @@ EOF
 }
 
 # ============================================================================
-# HELPERS: recreación automática de un contenedor YA EXISTENTE (-c)
+# HELPER: recrea un contenedor YA EXISTENTE inyectándole las variables de
+# dominio/SSL que necesita nginx-proxy + acme-companion.
 #
-# Docker no permite inyectar variables de entorno en un contenedor en
-# caliente, así que la ÚNICA forma de que nginx-proxy detecte VIRTUAL_HOST
-# es recrear el contenedor con esas variables ya puestas. Estas funciones
-# automatizan esa recreación en lugar de dejarla como tarea manual.
+# Docker NO permite modificar variables de entorno de un contenedor en
+# caliente, así que la única forma de "asignarle" un dominio a un contenedor
+# que ya está corriendo es recrearlo. Esta función conserva automáticamente:
+# imagen, resto de variables de entorno, volúmenes/binds, puertos publicados
+# y política de reinicio; y deja un respaldo del contenedor original por si
+# algo sale mal.
 # ============================================================================
-_ensure_jq() {
-  command -v jq &>/dev/null && return 0
-  log_info "Instalando 'jq' (necesario para leer la configuración de contenedores existentes)..."
-  if command -v apt-get &>/dev/null; then apt-get update -y && apt-get install -y jq
-  elif command -v dnf &>/dev/null; then dnf install -y jq
-  elif command -v yum &>/dev/null; then yum install -y jq
-  else die "No se pudo instalar 'jq' automáticamente; instálalo manualmente y reintenta."
+_recreate_container_with_proxy_vars() {
+  local CONTAINER="$1" ALL_HOSTS="$2" PORT="$3" LE_EMAIL="$4"
+
+  docker inspect "$CONTAINER" &>/dev/null || die "El contenedor '${CONTAINER}' no existe."
+
+  local IMAGE RESTART_POLICY
+  IMAGE="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER")"
+  RESTART_POLICY="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER")"
+  [[ -z "$RESTART_POLICY" || "$RESTART_POLICY" == "no" ]] && RESTART_POLICY="unless-stopped"
+
+  # Variables de entorno actuales, excluyendo las que vamos a fijar nosotros
+  # (para no duplicarlas con un valor distinto).
+  local -a ENV_ARGS=()
+  local e
+  while IFS= read -r e; do
+    [[ -z "$e" ]] && continue
+    case "$e" in
+      VIRTUAL_HOST=*|VIRTUAL_PORT=*|LETSENCRYPT_HOST=*|LETSENCRYPT_EMAIL=*) continue ;;
+    esac
+    ENV_ARGS+=(-e "$e")
+  done < <(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER")
+
+  # Puertos publicados actualmente en el host (se conservan tal cual para no
+  # romper accesos que ya dependan de ellos; puedes quitarlos después a mano
+  # una vez confirmes que el dominio ya funciona).
+  local -a PORT_ARGS=()
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && PORT_ARGS+=(-p "$p")
+  done < <(docker inspect -f '{{range $port, $conf := .HostConfig.PortBindings}}{{range $conf}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$port}}{{println}}{{end}}{{end}}' "$CONTAINER")
+
+  # Volúmenes / bind mounts actuales.
+  local -a MOUNT_ARGS=()
+  local m
+  while IFS= read -r m; do
+    [[ -n "$m" ]] && MOUNT_ARGS+=(-v "$m")
+  done < <(docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}}{{if not .RW}}:ro{{end}}{{println}}{{end}}' "$CONTAINER")
+
+  echo
+  log_warn "Se va a RECREAR el contenedor '${CONTAINER}' para inyectarle las variables de dominio/SSL."
+  log_warn "Se conservará: imagen (${IMAGE}), variables de entorno, volúmenes, puertos publicados y restart policy."
+  log_warn "El contenedor original quedará respaldado (parado, renombrado) por si algo falla."
+  read -r -p "¿Continuar con la recreación de '${CONTAINER}'? [y/N]: " CONFIRM
+  [[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Cancelado por el usuario. La app NO quedó publicada."
+
+  local BACKUP_NAME="${CONTAINER}_backup_$(date +%s)"
+  log_info "Deteniendo '${CONTAINER}' y respaldándolo como '${BACKUP_NAME}'..."
+  docker stop "$CONTAINER" >/dev/null
+  docker rename "$CONTAINER" "$BACKUP_NAME"
+
+  log_info "Creando el nuevo contenedor '${CONTAINER}' conectado al proxy..."
+  if docker run -d \
+      --name "$CONTAINER" \
+      --network "${NETWORK_NAME}" \
+      --restart "$RESTART_POLICY" \
+      "${PORT_ARGS[@]}" \
+      "${MOUNT_ARGS[@]}" \
+      "${ENV_ARGS[@]}" \
+      -e "VIRTUAL_HOST=${ALL_HOSTS}" \
+      -e "VIRTUAL_PORT=${PORT}" \
+      -e "LETSENCRYPT_HOST=${ALL_HOSTS}" \
+      -e "LETSENCRYPT_EMAIL=${LE_EMAIL}" \
+      "$IMAGE" >/dev/null
+  then
+    log_ok "Contenedor '${CONTAINER}' recreado y conectado a la red '${NETWORK_NAME}'."
+    log_info "El contenedor anterior quedó respaldado como '${BACKUP_NAME}' (parado)."
+    log_info "Cuando confirmes que todo funciona bien, puedes borrarlo con: docker rm ${BACKUP_NAME}"
+  else
+    log_err "Falló la recreación. Restaurando el contenedor original..."
+    docker rm -f "$CONTAINER" 2>/dev/null || true
+    docker rename "$BACKUP_NAME" "$CONTAINER"
+    docker start "$CONTAINER" >/dev/null
+    die "No se pudo recrear '${CONTAINER}'. Se restauró el original sin cambios."
   fi
-}
-
-# Intenta recrear el contenedor vía 'docker compose', combinando el/los
-# archivo(s) de compose ORIGINALES con un override que solo añade la red
-# del proxy y las 4 variables necesarias. No modifica el docker-compose.yml
-# original. Devuelve 0 si tuvo éxito, 1 si el contenedor no es de compose
-# o si algo falló (para que el llamador use el método genérico).
-_recreate_via_compose() {
-  local CNAME="$1" ALL_HOSTS="$2" PORT="$3" LE_EMAIL="$4" OVERRIDE_FILE="$5"
-
-  local PROJECT SERVICE WORKDIR CONFIG_FILES
-  PROJECT="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$CNAME" 2>/dev/null || true)"
-  SERVICE="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.service" }}' "$CNAME" 2>/dev/null || true)"
-  WORKDIR="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$CNAME" 2>/dev/null || true)"
-  CONFIG_FILES="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$CNAME" 2>/dev/null || true)"
-
-  [[ -z "$PROJECT" || -z "$SERVICE" || -z "$WORKDIR" || ! -d "$WORKDIR" ]] && return 1
-
-  log_info "'${CNAME}' fue creado con Docker Compose (proyecto '${PROJECT}', servicio '${SERVICE}')."
-  log_info "Genero un override de compose (no toco tu docker-compose.yml original) y recreo el servicio..."
-
-  cat > "$OVERRIDE_FILE" <<EOF
-services:
-  ${SERVICE}:
-    networks:
-      - ${NETWORK_NAME}
-    environment:
-      - VIRTUAL_HOST=${ALL_HOSTS}
-      - VIRTUAL_PORT=${PORT}
-      - LETSENCRYPT_HOST=${ALL_HOSTS}
-      - LETSENCRYPT_EMAIL=${LE_EMAIL}
-
-networks:
-  ${NETWORK_NAME}:
-    external: true
-EOF
-
-  local -a F_ARGS=()
-  IFS=',' read -ra _cf_arr <<< "$CONFIG_FILES"
-  local f
-  for f in "${_cf_arr[@]}"; do
-    [[ -z "$f" ]] && continue
-    F_ARGS+=(-f "$f")
-  done
-  F_ARGS+=(-f "$OVERRIDE_FILE")
-
-  if (cd "$WORKDIR" && docker compose -p "$PROJECT" "${F_ARGS[@]}" up -d "$SERVICE"); then
-    echo "${WORKDIR}|${PROJECT}|${CONFIG_FILES}|${SERVICE}" > "$(dirname "$OVERRIDE_FILE")/compose.meta"
-    return 0
-  fi
-  return 1
-}
-
-# Recrea un contenedor "plano" (creado con 'docker run', sin compose).
-# Estrategia: 'docker commit' congela el estado actual (filesystem, Env,
-# Cmd, Entrypoint, WorkingDir, User quedan HORNEADOS en la nueva imagen),
-# así que solo hace falta volver a indicar lo que Docker NO guarda en la
-# imagen: publicación de puertos, volúmenes/binds, política de reinicio y
-# redes. El contenedor original se conserva renombrado como <nombre>_bak
-# por si hay que revertir.
-_recreate_generic() {
-  local CNAME="$1" ALL_HOSTS="$2" PORT="$3" LE_EMAIL="$4"
-  _ensure_jq
-
-  log_warn "'${CNAME}' NO fue creado con Docker Compose (es un 'docker run' suelto)."
-  log_warn "Para que nginx-proxy detecte el dominio hay que RECREAR el contenedor con las variables VIRTUAL_HOST/VIRTUAL_PORT."
-  log_warn "Voy a: 1) congelar su estado actual con 'docker commit', 2) recrearlo con el mismo nombre, puertos, volúmenes y red, más esas variables."
-  log_warn "El contenedor original quedará respaldado (detenido) como '${CNAME}_bak' por si hace falta revertir."
-  read -r -p "¿Continuar con la recreación automática de '${CNAME}'? [y/N]: " CONF
-  [[ "$CONF" =~ ^[Yy]$ ]] || { log_info "Cancelado por el usuario."; return 1; }
-
-  local INSPECT; INSPECT="$(docker inspect "$CNAME")"
-  local SNAPSHOT="${CNAME}-proxy-snapshot:$(date +%s)"
-
-  log_info "Creando snapshot de la imagen actual (docker commit)..."
-  docker commit "$CNAME" "$SNAPSHOT" >/dev/null
-
-  local -a RUN_ARGS=(-d --name "$CNAME")
-
-  # Política de reinicio
-  local RNAME RMAX
-  RNAME="$(echo "$INSPECT" | jq -r '.[0].HostConfig.RestartPolicy.Name')"
-  RMAX="$(echo "$INSPECT" | jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount')"
-  if [[ -n "$RNAME" && "$RNAME" != "no" && "$RNAME" != "null" ]]; then
-    if [[ "$RNAME" == "on-failure" && "$RMAX" != "0" ]]; then
-      RUN_ARGS+=(--restart "on-failure:${RMAX}")
-    else
-      RUN_ARGS+=(--restart "$RNAME")
-    fi
-  fi
-
-  # Puertos publicados (host -> contenedor)
-  local pline
-  while IFS= read -r pline; do
-    [[ -z "$pline" ]] && continue
-    RUN_ARGS+=(-p "$pline")
-  done < <(echo "$INSPECT" | jq -r '
-    (.[0].HostConfig.PortBindings // {}) | to_entries[] as $e
-    | ($e.value // [])[]? | "\(.HostIp // "0.0.0.0"):\(.HostPort):\($e.key)"
-  ')
-
-  # Volúmenes y binds
-  local mline
-  while IFS= read -r mline; do
-    [[ -z "$mline" ]] && continue
-    RUN_ARGS+=(-v "$mline")
-  done < <(echo "$INSPECT" | jq -r '
-    (.[0].Mounts // [])[] | select(.Type=="volume" or .Type=="bind")
-    | if .Type=="bind" then "\(.Source):\(.Destination):\(if .RW then "rw" else "ro" end)"
-      else "\(.Name):\(.Destination):\(if .RW then "rw" else "ro" end)" end
-  ')
-
-  # Redes adicionales a las que ya estaba conectado (aparte de la del proxy)
-  local -a ORIG_NETS=()
-  mapfile -t ORIG_NETS < <(echo "$INSPECT" | jq -r '.[0].NetworkSettings.Networks | keys[]?')
-
-  # Variables del proxy (las propias del contenedor ya quedaron horneadas en el snapshot)
-  RUN_ARGS+=(-e "VIRTUAL_HOST=${ALL_HOSTS}" -e "VIRTUAL_PORT=${PORT}" \
-             -e "LETSENCRYPT_HOST=${ALL_HOSTS}" -e "LETSENCRYPT_EMAIL=${LE_EMAIL}")
-
-  log_info "Deteniendo y respaldando el contenedor original como '${CNAME}_bak'..."
-  docker stop "$CNAME" >/dev/null
-  docker rename "$CNAME" "${CNAME}_bak"
-
-  log_info "Creando el nuevo contenedor '${CNAME}' desde el snapshot con las variables del proxy..."
-  if ! docker run "${RUN_ARGS[@]}" "$SNAPSHOT"; then
-    log_err "Falló la creación del nuevo contenedor. Restaurando el original..."
-    docker rm -f "$CNAME" 2>/dev/null || true
-    docker rename "${CNAME}_bak" "$CNAME"
-    docker start "$CNAME" >/dev/null
-    return 1
-  fi
-
-  docker network connect "${NETWORK_NAME}" "$CNAME" 2>/dev/null || true
-  local n
-  for n in "${ORIG_NETS[@]}"; do
-    [[ "$n" == "bridge" || "$n" == "host" || "$n" == "none" || "$n" == "$NETWORK_NAME" ]] && continue
-    docker network connect "$n" "$CNAME" 2>/dev/null || true
-  done
-
-  log_ok "Contenedor '${CNAME}' recreado correctamente con el proxy configurado."
-  log_warn "El original quedó respaldado (detenido) como '${CNAME}_bak'. Si todo funciona bien, elimínalo con: docker rm ${CNAME}_bak"
-  return 0
 }
 
 # ============================================================================
 # COMANDO: add
 # ============================================================================
 cmd_add() {
-  local APP_NAME="" DOMAIN="" PORT="" IMAGE="" EXISTING_CONTAINER="" LE_EMAIL="" ALIASES=""
+  local APP_NAME="" DOMAIN="" PORT="" IMAGE="" EXISTING_CONTAINER="" LE_EMAIL="" ALIASES="" MANUAL_MODE="0"
   local OPTIND opt
-  while getopts ":n:H:p:m:i:c:a:h" opt; do
+  while getopts ":n:H:p:m:i:c:a:Mh" opt; do
     case "$opt" in
       n) APP_NAME="$OPTARG" ;;
       H) DOMAIN="$OPTARG" ;;
@@ -425,8 +351,9 @@ cmd_add() {
       i) IMAGE="$OPTARG" ;;
       c) EXISTING_CONTAINER="$OPTARG" ;;
       a) ALIASES="$OPTARG" ;;
+      M) MANUAL_MODE="1" ;;
       h) cat <<EOF
-Uso: sudo $0 add -n <app> -H <dominio> -p <puerto> [-m <email>] [-a <alias1,alias2,...>] (-i <imagen> | -c <contenedor-existente>)
+Uso: sudo $0 add -n <app> -H <dominio> -p <puerto> [-m <email>] [-a <alias1,alias2,...>] (-i <imagen> | -c <contenedor-existente> [-M])
   -n   Nombre corto/identificador de la app (ej: blog, api, tienda)
   -H   Dominio o subdominio PRINCIPAL (ej: blog.midominio.com)
   -p   Puerto interno que expone el contenedor (ej: 80, 3000, 8080)
@@ -435,7 +362,12 @@ Uso: sudo $0 add -n <app> -H <dominio> -p <puerto> [-m <email>] [-a <alias1,alia
        separados por coma (ej: www.blog.midominio.com,blog-alt.com)
        El certificado SSL cubrirá el dominio principal y todos los alias (SAN).
   -i   Imagen Docker a desplegar (crea un contenedor nuevo)
-  -c   Nombre de un contenedor Docker YA EXISTENTE a conectar a la red proxy
+  -c   Nombre de un contenedor Docker YA EXISTENTE a conectar a la red proxy.
+       Por defecto, el contenedor se RECREA automáticamente (conservando imagen,
+       env vars, volúmenes, puertos y restart policy) para poder inyectarle las
+       variables de dominio/SSL, ya que Docker no permite añadirlas en caliente.
+  -M   Modo manual: con -c, en vez de recrear el contenedor, solo genera un
+       archivo de referencia para que tú apliques los cambios a mano.
 EOF
          exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
@@ -492,28 +424,43 @@ EOF
   if [[ -n "$EXISTING_CONTAINER" ]]; then
     docker inspect "$EXISTING_CONTAINER" &>/dev/null || die "El contenedor '${EXISTING_CONTAINER}' no existe."
 
-    # nginx-proxy SOLO detecta el dominio si VIRTUAL_HOST/VIRTUAL_PORT están
-    # como variables de entorno del contenedor, y Docker no permite inyectar
-    # env vars en caliente. Por eso hay que RECREAR el contenedor sí o sí;
-    # lo hacemos automáticamente (vía compose si aplica, o genérico si no).
-    local OVERRIDE_FILE="${APP_DIR}/compose.override.proxy.yml"
-    local TIPO_GUARDAR="existente-compose"
+    if [[ "$MANUAL_MODE" == "1" ]]; then
+      log_info "Modo manual (-M): solo se genera la referencia, no se recrea el contenedor."
+      log_info "Conectando '${EXISTING_CONTAINER}' a la red '${NETWORK_NAME}'..."
+      docker network connect "${NETWORK_NAME}" "${EXISTING_CONTAINER}" 2>/dev/null \
+        || log_ok "El contenedor ya estaba conectado a la red."
 
-    if _recreate_via_compose "$EXISTING_CONTAINER" "$ALL_HOSTS" "$PORT" "$LE_EMAIL" "$OVERRIDE_FILE"; then
-      log_ok "Contenedor recreado vía Docker Compose y conectado al proxy."
-    elif _recreate_generic "$EXISTING_CONTAINER" "$ALL_HOSTS" "$PORT" "$LE_EMAIL"; then
-      TIPO_GUARDAR="existente-generic"
-      rm -f "$OVERRIDE_FILE"
-    else
-      rm -f "$OVERRIDE_FILE"
-      rmdir --ignore-fail-on-non-empty "$APP_DIR" 2>/dev/null || true
-      die "No se pudo recrear '${EXISTING_CONTAINER}' con las variables del proxy. No se registró la app."
+      cat > "${APP_DIR}/docker-compose.override.reference.yml" <<EOF
+# Añade este bloque al docker-compose.yml ORIGINAL del servicio
+# "${EXISTING_CONTAINER}" y ejecuta: docker compose up -d
+# (las variables de entorno no pueden inyectarse en caliente)
+services:
+  ${EXISTING_CONTAINER}:
+    networks:
+      - ${NETWORK_NAME}
+    environment:
+      - VIRTUAL_HOST=${ALL_HOSTS}
+      - VIRTUAL_PORT=${PORT}
+      - LETSENCRYPT_HOST=${ALL_HOSTS}
+      - LETSENCRYPT_EMAIL=${LE_EMAIL}
+
+networks:
+  ${NETWORK_NAME}:
+    external: true
+EOF
+      state_add "$APP_ID" "$DOMAIN" "$PORT" "existente" "$EXISTING_CONTAINER" "${ALIASES:--}"
+      log_ok "Referencia generada en: ${APP_DIR}/docker-compose.override.reference.yml"
+      log_warn "Recuerda aplicar ese bloque y recrear el contenedor para activar el enrutamiento."
+      return 0
     fi
 
-    state_add "$APP_ID" "$DOMAIN" "$PORT" "$TIPO_GUARDAR" "$EXISTING_CONTAINER" "${ALIASES:--}"
-    log_ok "Listo. '${ALL_HOSTS}' quedará enrutado hacia '${EXISTING_CONTAINER}:${PORT}' SIN necesidad de indicar el puerto."
-    echo "El certificado SSL se emite automáticamente en 30-90 segundos y"
-    echo "acme-companion lo renovará solo, sin intervención, ~30 días antes de vencer."
+    # Modo automático (por defecto): recreamos el contenedor con las variables
+    # de dominio/SSL ya inyectadas, conservando su configuración actual.
+    _recreate_container_with_proxy_vars "$EXISTING_CONTAINER" "$ALL_HOSTS" "$PORT" "$LE_EMAIL"
+
+    state_add "$APP_ID" "$DOMAIN" "$PORT" "existente" "$EXISTING_CONTAINER" "${ALIASES:--}"
+    log_ok "Listo. '${ALL_HOSTS}' quedará enrutado hacia '${EXISTING_CONTAINER}:${PORT}'."
+    echo "El certificado SSL se emite automáticamente en 30-90 segundos."
     echo "Verifica con: sudo $0 certs -n ${APP_ID}   |   sudo $0 logs -n ${APP_ID}"
     return 0
   fi
@@ -621,7 +568,7 @@ cmd_status() {
   fi
   while IFS=$'\t' read -r id domain port tipo ref aliases; do
     local cname="$id"
-    [[ "$tipo" == existente* ]] && cname="$ref"
+    [[ "$tipo" == "existente" ]] && cname="$ref"
     if docker inspect "$cname" &>/dev/null; then
       local st; st="$(docker inspect -f '{{.State.Status}}' "$cname")"
       printf "  %-15s %-35s -> %s\n" "$id" "$domain" "$st"
@@ -659,7 +606,7 @@ EOF
       local tipo cname
       tipo="$(echo "$RECORD" | cut -f4)"
       cname="$TARGET"
-      [[ "$tipo" == existente* ]] && cname="$(echo "$RECORD" | cut -f5)"
+      [[ "$tipo" == "existente" ]] && cname="$(echo "$RECORD" | cut -f5)"
       docker logs -f --tail 100 "$cname"
       ;;
   esac
@@ -964,6 +911,10 @@ interactive_menu() {
         elif [[ "$TIPO_SEL" == "b" ]]; then
           read -rp "Nombre del contenedor existente: " CONT
           ARGS+=(-c "$CONT")
+          echo "El contenedor se recreará automáticamente para poder inyectarle"
+          echo "las variables de dominio/SSL (Docker no permite añadirlas en caliente)."
+          read -rp "¿Prefieres modo manual, solo generar referencia y aplicarla tú? [y/N]: " MAN
+          [[ "$MAN" =~ ^[Yy]$ ]] && ARGS+=(-M)
         else
           log_warn "Opción inválida."; _pause; continue
         fi
