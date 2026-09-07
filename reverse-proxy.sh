@@ -113,6 +113,72 @@ state_get() {
 }
 
 # ============================================================================
+# LIMPIEZA COMPLETA DE UN DOMINIO / ALIASES
+# ============================================================================
+cleanup_domain_artifacts() {
+  local HOSTS="$1"
+  local d
+  local _domains
+
+  IFS=',' read -ra _domains <<< "$HOSTS"
+
+  for d in "${_domains[@]}"; do
+    d="$(echo "$d" | xargs)"
+    [[ -z "$d" ]] && continue
+
+    # Nunca borrar certificados/configuración que todavía pertenezcan a otra
+    # publicación registrada en el estado. Se compara el dominio principal y
+    # también cada alias como campo independiente.
+    local HOST_IN_USE=""
+    HOST_IN_USE="$(awk -F '\t' -v host="$d" -v current="$APP_ID" '
+      $1 != current {
+        if ($2 == host) { print "yes"; exit }
+        n = split($6, a, ",")
+        for (i = 1; i <= n; i++) {
+          gsub(/^ +| +$/, "", a[i])
+          if (a[i] == host) { print "yes"; exit }
+        }
+      }
+    ' "$STATE_FILE" 2>/dev/null || true)"
+    if [[ "$HOST_IN_USE" == "yes" ]]; then
+      log_warn "'${d}' todavía aparece en otra publicación; se conserva su certificado/configuración."
+      continue
+    fi
+
+    log_info "Limpiando certificados y configuración de '${d}'..."
+
+    # Certificados/cadenas/llaves que pertenecen exactamente a este host.
+    rm -f \
+      "${BASE_DIR}/nginx/certs/${d}.crt" \
+      "${BASE_DIR}/nginx/certs/${d}.key" \
+      "${BASE_DIR}/nginx/certs/${d}.chain.pem" \
+      "${BASE_DIR}/nginx/certs/${d}.fullchain.pem" \
+      "${BASE_DIR}/nginx/certs/${d}.dhparam.pem" 2>/dev/null || true
+
+    # Configuración personalizada por host de nginx-proxy, si existe.
+    rm -f \
+      "${BASE_DIR}/nginx/vhost.d/${d}" \
+      "${BASE_DIR}/nginx/vhost.d/${d}.conf" 2>/dev/null || true
+
+    # Estado específico de ACME para este dominio. No se toca la cuenta
+    # global de Let's Encrypt ni los certificados de otros dominios.
+    if docker inspect nginx-proxy-acme &>/dev/null; then
+      docker exec nginx-proxy-acme acme.sh --remove -d "$d" &>/dev/null || true
+      docker exec nginx-proxy-acme sh -c \
+        'rm -rf -- "$1" "$2"' sh \
+        "/etc/acme.sh/${d}" \
+        "/etc/acme.sh/${d}_ecc" 2>/dev/null || true
+    fi
+  done
+
+  # Fuerza a nginx-proxy a recargar la configuración después de eliminar
+  # el bridge y los archivos asociados al dominio.
+  if docker inspect nginx-proxy &>/dev/null; then
+    docker exec nginx-proxy nginx -s reload &>/dev/null || true
+  fi
+}
+
+# ============================================================================
 # COMANDO: install
 # ============================================================================
 cmd_install() {
@@ -455,27 +521,51 @@ cmd_remove() {
 
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   local TIPO; TIPO="$(echo "$RECORD" | cut -f4)"
+  local DOMAIN; DOMAIN="$(echo "$RECORD" | cut -f2)"
+  local ALIASES; ALIASES="$(echo "$RECORD" | cut -f6)"
+
+  # Reconstruimos la lista exacta de hosts que pertenecían a esta publicación.
+  local HOSTS="$DOMAIN"
+  if [[ -n "$ALIASES" && "$ALIASES" != "-" ]]; then
+    HOSTS="${HOSTS},${ALIASES}"
+  fi
 
   if [[ -f "${APP_DIR}/docker-compose.yml" ]]; then
     if [[ "$TIPO" == "nuevo" || "$TIPO" == "redirect" ]]; then
       log_info "Deteniendo y eliminando el contenedor '${APP_ID}'..."
-      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo bajar limpiamente; continúo."
+      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo bajar limpiamente; continúo con la limpieza."
     else
       local CONTENEDOR; CONTENEDOR="$(echo "$RECORD" | cut -f5)"
       log_info "Eliminando el bridge de proxy '${APP_ID}-proxy'..."
-      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo eliminar limpiamente el bridge; continúo."
-      log_warn "El contenedor original '${CONTENEDOR}' NO será eliminado."
+      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo eliminar limpiamente el bridge; continúo con la limpieza."
+      log_warn "El contenedor original '${CONTENEDOR}' NO será eliminado ni recreado."
       log_info "Desconectando '${CONTENEDOR}' de la red '${NETWORK_NAME}'..."
       docker network disconnect "${NETWORK_NAME}" "$CONTENEDOR" 2>/dev/null || true
     fi
-  else
+  elif [[ "$TIPO" == "existente" ]]; then
     local CONTENEDOR; CONTENEDOR="$(echo "$RECORD" | cut -f5)"
+    log_info "Desconectando '${CONTENEDOR}' de la red '${NETWORK_NAME}'..."
     docker network disconnect "${NETWORK_NAME}" "$CONTENEDOR" 2>/dev/null || true
   fi
 
-  rm -rf "$APP_DIR"
+  # Primero retiramos el registro actual. Así la limpieza puede comprobar
+  # si alguno de los hosts sigue siendo utilizado por OTRA publicación.
   state_remove_silent "$APP_ID"
-  log_ok "App '${APP_ID}' eliminada del proxy."
+
+  # IMPORTANTE: se limpia también el certificado/ACME del dominio y de sus
+  # aliases. Esto permite volver a registrar exactamente el mismo dominio.
+  cleanup_domain_artifacts "$HOSTS"
+
+  # El directorio de la publicación contiene únicamente la configuración
+  # creada por este script para esa app/bridge.
+  rm -rf "$APP_DIR"
+
+  log_ok "Publicación '${APP_ID}' eliminada completamente del proxy."
+  log_ok "Dominio(s) liberado(s): ${HOSTS}"
+  if [[ "$TIPO" == "existente" ]]; then
+    log_ok "El contenedor original se conserva intacto, junto con sus datos."
+  fi
+  log_ok "El dominio puede volver a utilizarse con la opción 2."
 }
 
 # ============================================================================
