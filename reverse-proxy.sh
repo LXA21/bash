@@ -369,6 +369,13 @@ issue_certificate() {
 
   log_info "Solicitando certificado para: ${hosts}"
   
+  # Forzamos la creación del archivo de credenciales aquí mismo para evitar errores si el usuario salta la instalación
+  if [[ -n "${DEFAULT_CF_TOKEN}" ]]; then
+    mkdir -p "$(dirname "$CF_CRED_FILE")"
+    echo "dns_cloudflare_api_token = ${DEFAULT_CF_TOKEN}" > "$CF_CRED_FILE"
+    chmod 600 "$CF_CRED_FILE"
+  fi
+
   local cert_cmd=(
     "certonly"
     "${args[@]}"
@@ -1115,4 +1122,3 @@ case "$COMMAND" in
   help|-h|--help) print_main_usage ;;
   *) log_err "Comando desconocido: '$COMMAND'"; echo; print_main_usage; exit 1 ;;
 esac
-
