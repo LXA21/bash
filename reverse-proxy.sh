@@ -31,7 +31,8 @@ BASE_DIR="/opt/reverse-proxy"
 NETWORK_NAME="proxy"
 STATE_FILE="${BASE_DIR}/.state/apps.tsv"   # registro de apps: id<TAB>dominio<TAB>puerto<TAB>tipo
 NGINX_IMAGE="nginx:stable-alpine"
-CERTBOT_IMAGE="certbot/certbot:v5.8.0"
+CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
+CF_CRED_FILE="${BASE_DIR}/nginx/certbot/cloudflare.ini"
 
 # ============================================================================
 # UTILIDADES DE SALIDA / LOG
@@ -73,7 +74,7 @@ COMANDOS:
   help        Muestra esta ayuda
 
 EJEMPLOS:
-  sudo $0 install -e admin@midominio.com
+  sudo $0 install -e admin@midominio.com -t "TU_TOKEN_DE_CLOUDFLARE"
   sudo $0 add -n blog -H blog.midominio.com -p 80 -m admin@midominio.com -i wordpress:latest
   sudo $0 add -n web -H midominio.com -a www.midominio.com -p 80 -i mi-app:latest
   sudo $0 add -n api -H api.midominio.com -p 3000 -m admin@midominio.com -c mi-api-existente
@@ -366,14 +367,33 @@ issue_certificate() {
   done
 
   log_info "Solicitando certificado para: ${hosts}"
-  certbot_run certonly \
-    --webroot -w /var/www/certbot \
-    "${args[@]}" \
-    --email "$email" \
-    --agree-tos \
-    --non-interactive \
-    --keep-until-expiring \
-    --no-eff-email
+  
+  local cert_cmd=(
+    "certonly"
+    "${args[@]}"
+    "--email" "$email"
+    "--agree-tos"
+    "--non-interactive"
+    "--keep-until-expiring"
+    "--no-eff-email"
+  )
+
+  if [[ -f "$CF_CRED_FILE" ]]; then
+    log_info "Token de Cloudflare detectado. Usando validación DNS-01..."
+    cert_cmd+=(
+      "--dns-cloudflare"
+      "--dns-cloudflare-credentials" "/etc/letsencrypt/cloudflare.ini"
+      "--dns-cloudflare-propagation-seconds" "20"
+    )
+  else
+    log_info "Usando validación HTTP-01 (Requiere nube gris en Cloudflare)..."
+    cert_cmd+=(
+      "--webroot"
+      "-w" "/var/www/certbot"
+    )
+  fi
+
+  certbot_run "${cert_cmd[@]}" 
 }
 
 # ============================================================================
@@ -382,13 +402,16 @@ issue_certificate() {
 cmd_install() {
   local LE_EMAIL=""
   local OPTIND opt
-  while getopts ":e:b:h" opt; do
+  local CF_TOKEN=""
+  while getopts ":e:b:t:h" opt; do
     case "$opt" in
       e) LE_EMAIL="$OPTARG" ;;
       b) BASE_DIR="$OPTARG" ;;
+      t) CF_TOKEN="$OPTARG" ;;
       h) cat <<EOF
-Uso: sudo $0 install -e <email-letsencrypt> [-b <directorio-base>]
+Uso: sudo $0 install -e <email-letsencrypt> [-t <cloudflare_token>] [-b <directorio-base>]
   -e   Email por defecto para el registro ACME de Let's Encrypt (obligatorio)
+  -t   Token de API de Cloudflare para validación DNS (opcional pero recomendado)
   -b   Directorio base de instalación (default: /opt/reverse-proxy)
 EOF
          exit 0 ;;
@@ -445,6 +468,13 @@ EOF
   ensure_state_file
   echo "$LE_EMAIL" > "${BASE_DIR}/.state/default_email"
   ensure_default_cert
+
+  if [[ -n "$CF_TOKEN" ]]; then
+    log_info "Guardando credenciales de Cloudflare en $CF_CRED_FILE..."
+    echo "dns_cloudflare_api_token = ${CF_TOKEN}" > "$CF_CRED_FILE"
+    chmod 600 "$CF_CRED_FILE"
+    log_ok "Token configurado. Certbot usará validación DNS-01."
+  fi
 
   if docker network inspect "${NETWORK_NAME}" &>/dev/null; then
     log_ok "La red '${NETWORK_NAME}' ya existe."
@@ -843,10 +873,10 @@ setup_renewal_timer() {
   cat > "$runner" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-docker run --rm \\
-  -v "${BASE_DIR}/nginx/certbot:/etc/letsencrypt" \\
-  -v "${BASE_DIR}/nginx/html:/var/www/certbot" \\
-  -v "${BASE_DIR}/nginx/logs:/var/log/letsencrypt" \\
+docker run --rm \
+  -v "${BASE_DIR}/nginx/certbot:/etc/letsencrypt" \
+  -v "${BASE_DIR}/nginx/html:/var/www/certbot" \
+  -v "${BASE_DIR}/nginx/logs:/var/log/letsencrypt" \
   "${CERTBOT_IMAGE}" renew --non-interactive
 if docker inspect nginx-proxy >/dev/null 2>&1; then
   docker exec nginx-proxy nginx -t
@@ -994,7 +1024,9 @@ interactive_menu() {
         read -rp "Email para Let's Encrypt (obligatorio): " EMAIL
         [[ -z "$EMAIL" ]] && { log_warn "El email es obligatorio."; _pause; continue; }
         read -rp "Directorio base [Enter = ${BASE_DIR}]: " BDIR
+        read -rp "Token API Cloudflare (Enter para omitir y usar HTTP-01): " TOKEN_CF
         ARGS=(-e "$EMAIL"); [[ -n "$BDIR" ]] && ARGS+=(-b "$BDIR")
+        [[ -n "$TOKEN_CF" ]] && ARGS+=(-t "$TOKEN_CF")
         _run_safe cmd_install "${ARGS[@]}"
         ;;
       2)
@@ -1081,3 +1113,4 @@ case "$COMMAND" in
   help|-h|--help) print_main_usage ;;
   *) log_err "Comando desconocido: '$COMMAND'"; echo; print_main_usage; exit 1 ;;
 esac
+
