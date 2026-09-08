@@ -155,6 +155,11 @@ hosts_to_args() {
 # y comparte el mismo directorio para el desafío HTTP-01 de Certbot.
 generate_nginx_config() {
   ensure_state_file
+  # Garantiza las rutas antes de crear managed.conf.tmp. Esto permite usar
+  # add/remove incluso si la instalación existente quedó incompleta o proviene
+  # de una versión anterior del script.
+  mkdir -p "${BASE_DIR}/nginx/conf.d" "${BASE_DIR}/nginx/html/.well-known/acme-challenge" \
+           "${BASE_DIR}/nginx/certbot" "${BASE_DIR}/nginx/logs" "${BASE_DIR}/nginx/certs"
   local out="${BASE_DIR}/nginx/conf.d/managed.conf"
   local tmp="${out}.tmp"
   : > "$tmp"
@@ -448,6 +453,13 @@ EOF
     docker network create "${NETWORK_NAME}"
   fi
 
+  # Migración segura desde una instalación anterior con acme-companion.
+  # Solo se retira el contenedor obsoleto; no se toca ninguna app ni volumen.
+  if docker inspect nginx-proxy-acme >/dev/null 2>&1; then
+    log_info "Retirando el contenedor antiguo 'nginx-proxy-acme'..."
+    docker rm -f nginx-proxy-acme >/dev/null 2>&1 || true
+  fi
+
   log_info "Generando docker-compose.yml de NGINX + almacenamiento Certbot..."
   cat > "${BASE_DIR}/docker-compose.yml" <<EOF
 services:
@@ -716,8 +728,8 @@ cmd_logs() {
     case "$opt" in
       n) TARGET="$OPTARG" ;;
       h) cat <<EOF
-Uso: sudo $0 logs [-n proxy|certbot|acme|<app>]
-  -n   'proxy' (default), 'certbot', 'acme' (alias compatible), o id de app
+Uso: sudo $0 logs [-n proxy|certbot|<app>]
+  -n   'proxy' (default), 'certbot' o id de app
 EOF
          exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
@@ -726,7 +738,7 @@ EOF
   done
   case "$TARGET" in
     proxy) docker logs -f --tail 100 nginx-proxy ;;
-    certbot|acme)
+    certbot)
       local logfile="${BASE_DIR}/nginx/logs/letsencrypt.log"
       [[ -f "$logfile" ]] || die "Todavía no existe el log de Certbot en ${logfile}."
       tail -f "$logfile" ;;
