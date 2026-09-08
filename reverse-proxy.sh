@@ -113,72 +113,6 @@ state_get() {
 }
 
 # ============================================================================
-# LIMPIEZA COMPLETA DE UN DOMINIO / ALIASES
-# ============================================================================
-cleanup_domain_artifacts() {
-  local HOSTS="$1"
-  local d
-  local _domains
-
-  IFS=',' read -ra _domains <<< "$HOSTS"
-
-  for d in "${_domains[@]}"; do
-    d="$(echo "$d" | xargs)"
-    [[ -z "$d" ]] && continue
-
-    # Nunca borrar certificados/configuración que todavía pertenezcan a otra
-    # publicación registrada en el estado. Se compara el dominio principal y
-    # también cada alias como campo independiente.
-    local HOST_IN_USE=""
-    HOST_IN_USE="$(awk -F '\t' -v host="$d" -v current="$APP_ID" '
-      $1 != current {
-        if ($2 == host) { print "yes"; exit }
-        n = split($6, a, ",")
-        for (i = 1; i <= n; i++) {
-          gsub(/^ +| +$/, "", a[i])
-          if (a[i] == host) { print "yes"; exit }
-        }
-      }
-    ' "$STATE_FILE" 2>/dev/null || true)"
-    if [[ "$HOST_IN_USE" == "yes" ]]; then
-      log_warn "'${d}' todavía aparece en otra publicación; se conserva su certificado/configuración."
-      continue
-    fi
-
-    log_info "Limpiando certificados y configuración de '${d}'..."
-
-    # Certificados/cadenas/llaves que pertenecen exactamente a este host.
-    rm -f \
-      "${BASE_DIR}/nginx/certs/${d}.crt" \
-      "${BASE_DIR}/nginx/certs/${d}.key" \
-      "${BASE_DIR}/nginx/certs/${d}.chain.pem" \
-      "${BASE_DIR}/nginx/certs/${d}.fullchain.pem" \
-      "${BASE_DIR}/nginx/certs/${d}.dhparam.pem" 2>/dev/null || true
-
-    # Configuración personalizada por host de nginx-proxy, si existe.
-    rm -f \
-      "${BASE_DIR}/nginx/vhost.d/${d}" \
-      "${BASE_DIR}/nginx/vhost.d/${d}.conf" 2>/dev/null || true
-
-    # Estado específico de ACME para este dominio. No se toca la cuenta
-    # global de Let's Encrypt ni los certificados de otros dominios.
-    if docker inspect nginx-proxy-acme &>/dev/null; then
-      docker exec nginx-proxy-acme acme.sh --remove -d "$d" &>/dev/null || true
-      docker exec nginx-proxy-acme sh -c \
-        'rm -rf -- "$1" "$2"' sh \
-        "/etc/acme.sh/${d}" \
-        "/etc/acme.sh/${d}_ecc" 2>/dev/null || true
-    fi
-  done
-
-  # Fuerza a nginx-proxy a recargar la configuración después de eliminar
-  # el bridge y los archivos asociados al dominio.
-  if docker inspect nginx-proxy &>/dev/null; then
-    docker exec nginx-proxy nginx -s reload &>/dev/null || true
-  fi
-}
-
-# ============================================================================
 # COMANDO: install
 # ============================================================================
 cmd_install() {
@@ -259,6 +193,23 @@ EOF
     docker network create "${NETWORK_NAME}"
   fi
 
+  # ---- Firewall: el reto ACME HTTP-01 EXIGE que el puerto 80 sea alcanzable
+  # públicamente (sin esto Let's Encrypt nunca podrá validar ningún subdominio) ----
+  log_info "Verificando/abriendo puertos 80 y 443 en el firewall local..."
+  if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    ufw allow 80/tcp  >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    log_ok "Puertos 80/443 permitidos en ufw."
+  elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-service=http  >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-service=https >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    log_ok "Puertos 80/443 permitidos en firewalld."
+  else
+    log_info "No se detectó ufw/firewalld activo administrando el firewall local."
+    log_warn "Confirma manualmente que los puertos 80 y 443 estén abiertos hacia internet (firewall del proveedor / security group / router)."
+  fi
+
   # ---- docker-compose.yml del proxy ----
   log_info "Generando docker-compose.yml de nginx-proxy + acme-companion..."
   cat > "${BASE_DIR}/docker-compose.yml" <<EOF
@@ -295,6 +246,10 @@ services:
     environment:
       - DEFAULT_EMAIL=${LE_EMAIL}
       - NGINX_PROXY_CONTAINER=nginx-proxy
+      # Fuerza el reto ACME HTTP-01 (webroot, vía el volumen ./nginx/html
+      # compartido con nginx-proxy) para TODOS los dominios/subdominios.
+      - ACME_CHALLENGE=HTTP-01
+      - ACME_HTTP_PORT=80
 
 networks:
   ${NETWORK_NAME}:
@@ -313,6 +268,65 @@ EOF
   echo "--------------------------------------------------------------"
   echo
   echo "Siguiente paso: sudo $0 add -n <app> -H <dominio> -p <puerto> -m <email> -i <imagen>"
+}
+
+# ============================================================================
+# HELPERS DE VERIFICACIÓN DNS (pre-vuelo antes de pedir el certificado)
+#
+# El reto ACME HTTP-01 solo funciona si, en el momento de la petición, el
+# dominio/subdominio ya resuelve por DNS público hacia la IP de ESTE servidor
+# y el puerto 80 es alcanzable desde internet. Si un subdominio no tiene su
+# registro A/AAAA (o apunta a otro lado), acme-companion falla en silencio
+# reintentando, y parece que "no asigna certificado". Por eso se verifica acá.
+# ============================================================================
+get_public_ip() {
+  curl -fsS -4 --max-time 5 https://ifconfig.me 2>/dev/null \
+    || curl -fsS -4 --max-time 5 https://api.ipify.org 2>/dev/null \
+    || true
+}
+
+resolve_domain_ip() {
+  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | head -n1
+}
+
+# Verifica una lista de dominios separados por coma contra la IP pública del
+# servidor. Devuelve 1 si algún dominio no está listo para HTTP-01.
+check_dns_ready() {
+  local hosts_csv="$1" server_ip="$2"
+  local all_ok=0
+  local h resolved
+  IFS=',' read -ra _hosts_arr <<< "$hosts_csv"
+  for h in "${_hosts_arr[@]}"; do
+    [[ -z "$h" ]] && continue
+    resolved="$(resolve_domain_ip "$h")"
+    if [[ -z "$resolved" ]]; then
+      log_warn "'${h}' no resuelve a ninguna IP todavía (falta el registro DNS A)."
+      all_ok=1
+    elif [[ -n "$server_ip" && "$resolved" != "$server_ip" ]]; then
+      log_warn "'${h}' resuelve a ${resolved}, pero la IP pública de este servidor es ${server_ip}."
+      all_ok=1
+    else
+      log_ok "'${h}' ya apunta a este servidor (${resolved})."
+    fi
+  done
+  return $all_ok
+}
+
+# Punto único que llaman 'add' y 'redirect' antes de levantar el contenedor.
+preflight_dns_check() {
+  local hosts_csv="$1"
+  local server_ip; server_ip="$(get_public_ip)"
+  [[ -z "$server_ip" ]] && { log_warn "No se pudo determinar la IP pública de este servidor; se omite la verificación de DNS."; return 0; }
+
+  log_info "Verificando DNS (necesario para el reto ACME HTTP-01)..."
+  if ! check_dns_ready "$hosts_csv" "$server_ip"; then
+    echo
+    log_warn "Mientras el/los dominio(s) de arriba no apunten a ${server_ip} en el DNS público,"
+    log_warn "Let's Encrypt NO podrá validar el reto HTTP-01 y el certificado NO se emitirá"
+    log_warn "(el sitio seguirá funcionando en HTTP plano, sin candado, hasta corregirlo)."
+    read -r -p "¿Continuar de todas formas? [y/N]: " _cont
+    [[ "$_cont" =~ ^[Yy]$ ]] || die "Cancelado. Corrige el/los registro(s) DNS y vuelve a intentar."
+  fi
 }
 
 # ============================================================================
@@ -391,60 +405,29 @@ EOF
     die "Ya existe una app registrada con el id '${APP_ID}'. Usa 'remove' primero o elige otro nombre (-n)."
   fi
 
+  preflight_dns_check "$ALL_HOSTS"
+
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   mkdir -p "$APP_DIR"
 
   if [[ -n "$EXISTING_CONTAINER" ]]; then
     docker inspect "$EXISTING_CONTAINER" &>/dev/null || die "El contenedor '${EXISTING_CONTAINER}' no existe."
 
-    # Un contenedor existente no puede recibir VIRTUAL_* / LETSENCRYPT_*
-    # simplemente con "docker network connect". Creamos un bridge NGINX
-    # dedicado que recibe tráfico del reverse proxy y lo reenvía al
-    # contenedor existente por la red Docker compartida.
-    local BRIDGE_NAME="${APP_ID}-proxy"
-    local BRIDGE_DIR="${APP_DIR}"
-
     log_info "Conectando '${EXISTING_CONTAINER}' a la red '${NETWORK_NAME}'..."
     docker network connect "${NETWORK_NAME}" "${EXISTING_CONTAINER}" 2>/dev/null \
       || log_ok "El contenedor ya estaba conectado a la red."
 
-    cat > "${BRIDGE_DIR}/nginx.conf" <<EOF
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://${EXISTING_CONTAINER}:${PORT};
-        proxy_http_version 1.1;
-
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
-    }
-}
-EOF
-
-    cat > "${BRIDGE_DIR}/docker-compose.yml" <<EOF
+    cat > "${APP_DIR}/docker-compose.override.reference.yml" <<EOF
+# Añade este bloque al docker-compose.yml ORIGINAL del servicio
+# "${EXISTING_CONTAINER}" y ejecuta: docker compose up -d
+# (las variables de entorno no pueden inyectarse en caliente)
 services:
-  ${BRIDGE_NAME}:
-    image: nginx:alpine
-    container_name: ${BRIDGE_NAME}
-    restart: unless-stopped
+  ${EXISTING_CONTAINER}:
     networks:
       - ${NETWORK_NAME}
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     environment:
       - VIRTUAL_HOST=${ALL_HOSTS}
-      - VIRTUAL_PORT=80
+      - VIRTUAL_PORT=${PORT}
       - LETSENCRYPT_HOST=${ALL_HOSTS}
       - LETSENCRYPT_EMAIL=${LE_EMAIL}
 
@@ -452,17 +435,13 @@ networks:
   ${NETWORK_NAME}:
     external: true
 EOF
-
-    log_info "Levantando bridge '${BRIDGE_NAME}'..."
-    (cd "$BRIDGE_DIR" && docker compose up -d)
-
     state_add "$APP_ID" "$DOMAIN" "$PORT" "existente" "$EXISTING_CONTAINER" "${ALIASES:--}"
-
-    log_ok "Dominio '${ALL_HOSTS}' publicado mediante HTTPS sin puerto."
-    log_ok "El tráfico externo 80/443 será reenviado internamente a '${EXISTING_CONTAINER}:${PORT}'."
-    echo "URL pública: https://${DOMAIN}/"
-    echo "El contenedor original NO fue recreado ni eliminado."
-    echo "El certificado SSL será gestionado automáticamente por acme-companion."
+    log_ok "Referencia generada en: ${APP_DIR}/docker-compose.override.reference.yml"
+    log_warn "IMPORTANTE: acme-companion detecta los dominios leyendo las variables de entorno"
+    log_warn "VIRTUAL_HOST/LETSENCRYPT_HOST del contenedor en ejecución. Mientras NO apliques ese"
+    log_warn "bloque a '${EXISTING_CONTAINER}' y lo recrees con 'docker compose up -d', el/los"
+    log_warn "subdominio(s) '${ALL_HOSTS}' NO recibirán certificado (esta es la causa más común"
+    log_warn "de 'no me asigna certificado a los subdominios' cuando se usa -c)."
     return 0
   fi
 
@@ -521,51 +500,20 @@ cmd_remove() {
 
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   local TIPO; TIPO="$(echo "$RECORD" | cut -f4)"
-  local DOMAIN; DOMAIN="$(echo "$RECORD" | cut -f2)"
-  local ALIASES; ALIASES="$(echo "$RECORD" | cut -f6)"
 
-  # Reconstruimos la lista exacta de hosts que pertenecían a esta publicación.
-  local HOSTS="$DOMAIN"
-  if [[ -n "$ALIASES" && "$ALIASES" != "-" ]]; then
-    HOSTS="${HOSTS},${ALIASES}"
-  fi
-
-  if [[ -f "${APP_DIR}/docker-compose.yml" ]]; then
-    if [[ "$TIPO" == "nuevo" || "$TIPO" == "redirect" ]]; then
-      log_info "Deteniendo y eliminando el contenedor '${APP_ID}'..."
-      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo bajar limpiamente; continúo con la limpieza."
-    else
-      local CONTENEDOR; CONTENEDOR="$(echo "$RECORD" | cut -f5)"
-      log_info "Eliminando el bridge de proxy '${APP_ID}-proxy'..."
-      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo eliminar limpiamente el bridge; continúo con la limpieza."
-      log_warn "El contenedor original '${CONTENEDOR}' NO será eliminado ni recreado."
-      log_info "Desconectando '${CONTENEDOR}' de la red '${NETWORK_NAME}'..."
-      docker network disconnect "${NETWORK_NAME}" "$CONTENEDOR" 2>/dev/null || true
-    fi
-  elif [[ "$TIPO" == "existente" ]]; then
+  if [[ "$TIPO" == "nuevo" || "$TIPO" == "redirect" ]] && [[ -f "${APP_DIR}/docker-compose.yml" ]]; then
+    log_info "Deteniendo y eliminando el contenedor '${APP_ID}'..."
+    (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo bajar limpiamente; continúo."
+  else
     local CONTENEDOR; CONTENEDOR="$(echo "$RECORD" | cut -f5)"
-    log_info "Desconectando '${CONTENEDOR}' de la red '${NETWORK_NAME}'..."
+    log_warn "'${APP_ID}' apunta a un contenedor existente ('${CONTENEDOR}')."
+    log_warn "Solo se desconectará de la red '${NETWORK_NAME}'; el contenedor NO se eliminará."
     docker network disconnect "${NETWORK_NAME}" "$CONTENEDOR" 2>/dev/null || true
   fi
 
-  # Primero retiramos el registro actual. Así la limpieza puede comprobar
-  # si alguno de los hosts sigue siendo utilizado por OTRA publicación.
-  state_remove_silent "$APP_ID"
-
-  # IMPORTANTE: se limpia también el certificado/ACME del dominio y de sus
-  # aliases. Esto permite volver a registrar exactamente el mismo dominio.
-  cleanup_domain_artifacts "$HOSTS"
-
-  # El directorio de la publicación contiene únicamente la configuración
-  # creada por este script para esa app/bridge.
   rm -rf "$APP_DIR"
-
-  log_ok "Publicación '${APP_ID}' eliminada completamente del proxy."
-  log_ok "Dominio(s) liberado(s): ${HOSTS}"
-  if [[ "$TIPO" == "existente" ]]; then
-    log_ok "El contenedor original se conserva intacto, junto con sus datos."
-  fi
-  log_ok "El dominio puede volver a utilizarse con la opción 2."
+  state_remove_silent "$APP_ID"
+  log_ok "App '${APP_ID}' eliminada del proxy."
 }
 
 # ============================================================================
@@ -820,6 +768,8 @@ EOF
   if [[ -n "$(state_get "$APP_ID")" ]]; then
     die "Ya existe una app/registro con el id '${APP_ID}'. Usa 'remove' primero o elige otro nombre."
   fi
+
+  preflight_dns_check "$DOMAIN"
 
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   mkdir -p "$APP_DIR"
