@@ -33,7 +33,8 @@ STATE_FILE="${BASE_DIR}/.state/apps.tsv"   # registro de apps: id<TAB>dominio<TA
 NGINX_IMAGE="nginx:stable-alpine"
 CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
 CF_CRED_FILE="${BASE_DIR}/nginx/certbot/cloudflare.ini"
-DEFAULT_CF_TOKEN="cfut_GpioAdPClNnJ0dwQMBJdTM7bLjqvNlWkfPfBrQIk63e73be6"
+CF_EMAIL="gallardomelkis@gmail.com"
+CF_GLOBAL_KEY="cfk_KallJOU3FXfFP57SJRRpSjyad44zVtIokBpGKvdk917d3275"
 
 # ============================================================================
 # UTILIDADES DE SALIDA / LOG
@@ -369,10 +370,11 @@ issue_certificate() {
 
   log_info "Solicitando certificado para: ${hosts}"
   
-  # Forzamos la creación del archivo de credenciales aquí mismo para evitar errores si el usuario salta la instalación
-  if [[ -n "${DEFAULT_CF_TOKEN}" ]]; then
+  # Forzamos la creación del archivo de credenciales con la Global API Key
+  if [[ -n "${CF_GLOBAL_KEY}" && "${CF_GLOBAL_KEY}" != "tu_global_api_key_aqui" ]]; then
     mkdir -p "$(dirname "$CF_CRED_FILE")"
-    echo "dns_cloudflare_api_token = ${DEFAULT_CF_TOKEN}" > "$CF_CRED_FILE"
+    echo "dns_cloudflare_email = ${CF_EMAIL}" > "$CF_CRED_FILE"
+    echo "dns_cloudflare_api_key = ${CF_GLOBAL_KEY}" >> "$CF_CRED_FILE"
     chmod 600 "$CF_CRED_FILE"
   fi
 
