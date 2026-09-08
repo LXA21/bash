@@ -33,6 +33,7 @@ STATE_FILE="${BASE_DIR}/.state/apps.tsv"   # registro de apps: id<TAB>dominio<TA
 NGINX_IMAGE="nginx:stable-alpine"
 CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
 CF_CRED_FILE="${BASE_DIR}/nginx/certbot/cloudflare.ini"
+DEFAULT_CF_TOKEN="cfut_fpZVlOTvpNSKcZd6LnDIsxxX9Jc7VLzBiwlwNCS71b1e1965"
 
 # ============================================================================
 # UTILIDADES DE SALIDA / LOG
@@ -402,7 +403,7 @@ issue_certificate() {
 cmd_install() {
   local LE_EMAIL=""
   local OPTIND opt
-  local CF_TOKEN=""
+  local CF_TOKEN="${DEFAULT_CF_TOKEN}"
   while getopts ":e:b:t:h" opt; do
     case "$opt" in
       e) LE_EMAIL="$OPTARG" ;;
@@ -1024,7 +1025,8 @@ interactive_menu() {
         read -rp "Email para Let's Encrypt (obligatorio): " EMAIL
         [[ -z "$EMAIL" ]] && { log_warn "El email es obligatorio."; _pause; continue; }
         read -rp "Directorio base [Enter = ${BASE_DIR}]: " BDIR
-        read -rp "Token API Cloudflare (Enter para omitir y usar HTTP-01): " TOKEN_CF
+        read -rp "Token API Cloudflare (Enter para usar el token integrado): " TOKEN_CF
+        [[ -z "$TOKEN_CF" ]] && TOKEN_CF="$DEFAULT_CF_TOKEN"
         ARGS=(-e "$EMAIL"); [[ -n "$BDIR" ]] && ARGS+=(-b "$BDIR")
         [[ -n "$TOKEN_CF" ]] && ARGS+=(-t "$TOKEN_CF")
         _run_safe cmd_install "${ARGS[@]}"
