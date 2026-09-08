@@ -33,7 +33,7 @@ STATE_FILE="${BASE_DIR}/.state/apps.tsv"   # registro de apps: id<TAB>dominio<TA
 NGINX_IMAGE="nginx:stable-alpine"
 CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
 CF_CRED_FILE="${BASE_DIR}/nginx/certbot/cloudflare.ini"
-DEFAULT_CF_TOKEN="cfut_6pOvks6l6SihKT7uzey62vEMFcPsCdzupZvXqetq878a3668"
+DEFAULT_CF_TOKEN="cfut_GpioAdPClNnJ0dwQMBJdTM7bLjqvNlWkfPfBrQIk63e73be6"
 
 # ============================================================================
 # UTILIDADES DE SALIDA / LOG
