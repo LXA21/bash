@@ -454,11 +454,11 @@ services:
     networks:
       - ${NETWORK_NAME}
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./nginx/certs:/etc/nginx/certs:ro
-      - ./nginx/certbot:/etc/letsencrypt:ro
-      - ./nginx/html:/usr/share/nginx/html:ro
-      - ./nginx/logs:/var/log/nginx
+      - ${BASE_DIR}/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ${BASE_DIR}/nginx/certs:/etc/nginx/certs:ro
+      - ${BASE_DIR}/nginx/certbot:/etc/letsencrypt:ro
+      - ${BASE_DIR}/nginx/html:/usr/share/nginx/html:ro
+      - ${BASE_DIR}/nginx/logs:/var/log/nginx
 
 networks:
   ${NETWORK_NAME}:
