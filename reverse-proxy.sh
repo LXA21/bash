@@ -8,17 +8,7 @@
 # Linux, con emisión y renovación automática de SSL (Let's Encrypt).
 #
 # Todo el ciclo de vida se maneja desde este único archivo mediante
-# subcomandos:
-#
-#   sudo ./reverse-proxy.sh install -e <email>
-#   sudo ./reverse-proxy.sh add     -n <app> -H <dominio> -p <puerto> -m <email> (-i <imagen> | -c <contenedor>)
-#   sudo ./reverse-proxy.sh remove  -n <app>
-#   sudo ./reverse-proxy.sh list
-#   sudo ./reverse-proxy.sh status
-#   sudo ./reverse-proxy.sh logs    [-n <app>|proxy|acme]
-#   sudo ./reverse-proxy.sh uninstall
-#
-# Compatible con: Ubuntu/Debian (apt) y RHEL/CentOS/Alma/Rocky (dnf/yum)
+# subcomandos.
 ###############################################################################
 
 set -euo pipefail
@@ -29,11 +19,10 @@ IFS=$'\n\t'
 # ============================================================================
 BASE_DIR="/opt/reverse-proxy"
 NETWORK_NAME="proxy"
-STATE_FILE="${BASE_DIR}/.state/apps.tsv"   # registro de apps: id<TAB>dominio<TAB>puerto<TAB>tipo
+STATE_FILE="${BASE_DIR}/.state/apps.tsv"   
 NGINX_IMAGE="nginx:stable-alpine"
 CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
 CF_CRED_FILE="${BASE_DIR}/nginx/certbot/cloudflare.ini"
-DEFAULT_CF_TOKEN="cfut_GpioAdPClNnJ0dwQMBJdTM7bLjqvNlWkfPfBrQIk63e73be6"
 
 # ============================================================================
 # UTILIDADES DE SALIDA / LOG
@@ -50,7 +39,6 @@ require_root() {
 }
 
 # ============================================================================
-# ============================================================================
 # AYUDA GENERAL
 # ============================================================================
 print_main_usage() {
@@ -60,32 +48,6 @@ reverse-proxy.sh — Administrador de Proxy Inverso NGINX sobre Docker
 USO:
   sudo $0                    Modo interactivo
   sudo $0 <comando> [opciones]
-
-COMANDOS:
-  install     Instala Docker, la red compartida, NGINX y Certbot
-  add         Publica un dominio/subdominio hacia un contenedor (nuevo o existente)
-  redirect    Crea una redirección 301 pura de un dominio hacia otra URL
-  remove      Elimina una publicación previamente creada
-  list        Lista las apps/dominios publicados
-  status      Muestra el estado de NGINX y de las apps
-  logs        Muestra logs de NGINX, Certbot o una app
-  certs       Muestra el estado y vencimiento de los certificados SSL
-  renew       Fuerza la renovación de un certificado (o de todos)
-  uninstall   Detiene y elimina NGINX (no borra las apps)
-  help        Muestra esta ayuda
-
-EJEMPLOS:
-  sudo $0 install -e admin@midominio.com -t "TU_TOKEN_DE_CLOUDFLARE"
-  sudo $0 add -n blog -H blog.midominio.com -p 80 -m admin@midominio.com -i wordpress:latest
-  sudo $0 add -n web -H midominio.com -a www.midominio.com -p 80 -i mi-app:latest
-  sudo $0 add -n api -H api.midominio.com -p 3000 -m admin@midominio.com -c mi-api-existente
-  sudo $0 redirect -n old-blog -H viejo.midominio.com -t https://nuevo.midominio.com
-  sudo $0 list
-  sudo $0 certs
-  sudo $0 renew -n blog
-  sudo $0 renew -n all
-  sudo $0 logs -n blog
-  sudo $0 remove -n blog
 EOF
 }
 
@@ -98,7 +60,6 @@ ensure_state_file() {
 }
 
 state_add() {
-  # id, dominio, puerto, tipo(nuevo|existente|redirect), referencia, aliases
   ensure_state_file
   state_remove_silent "$1"
   printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" "${6:--}" >> "$STATE_FILE"
@@ -153,13 +114,8 @@ hosts_to_args() {
   done
 }
 
-# NGINX se configura centralmente. Cada publicación tiene un bloque propio
-# y comparte el mismo directorio para el desafío HTTP-01 de Certbot.
 generate_nginx_config() {
   ensure_state_file
-  # Garantiza las rutas antes de crear managed.conf.tmp. Esto permite usar
-  # add/remove incluso si la instalación existente quedó incompleta o proviene
-  # de una versión anterior del script.
   mkdir -p "${BASE_DIR}/nginx/conf.d" "${BASE_DIR}/nginx/html/.well-known/acme-challenge" \
            "${BASE_DIR}/nginx/certbot" "${BASE_DIR}/nginx/logs" "${BASE_DIR}/nginx/certs"
   local out="${BASE_DIR}/nginx/conf.d/managed.conf"
@@ -178,7 +134,6 @@ generate_nginx_config() {
     [[ -f "$crt" && -f "$key" ]] && has_cert="true"
 
     if [[ "$has_cert" == "true" ]]; then
-      # HTTP solo mantiene disponible el desafío ACME y redirige el tráfico real a HTTPS.
       cat >> "$tmp" <<EOF
 server {
     listen 80;
@@ -239,7 +194,6 @@ server {
 EOF
       fi
     else
-      # Antes de emitir: HTTP accesible para HTTP-01 y backend/redirect funcional.
       if [[ "$tipo" == "redirect" ]]; then
         cat >> "$tmp" <<EOF
 server {
@@ -300,8 +254,7 @@ EOF
 
   mv -f "$tmp" "$out"
 }
-# Certificado autofirmado solo para el default_server de 443. Nunca se utiliza
-# como certificado de una publicación real.
+
 ensure_default_cert() {
   mkdir -p "${BASE_DIR}/nginx/certs"
   if [[ ! -f "${BASE_DIR}/nginx/certs/default.crt" || ! -f "${BASE_DIR}/nginx/certs/default.key" ]]; then
@@ -357,7 +310,7 @@ cleanup_domain_artifacts() {
 }
 
 issue_certificate() {
-  local domain="$1" aliases="$2" email="$3"
+  local domain="$1" aliases="$2" email="$3" token="${4:-}"
   local hosts; hosts="$(all_hosts "$domain" "$aliases")"
   local args=()
   IFS=',' read -ra _hs <<< "$hosts"
@@ -369,10 +322,9 @@ issue_certificate() {
 
   log_info "Solicitando certificado para: ${hosts}"
   
-  # Forzamos la creación del archivo de credenciales aquí mismo para evitar errores si el usuario salta la instalación
-  if [[ -n "${DEFAULT_CF_TOKEN}" ]]; then
+  if [[ -n "$token" ]]; then
     mkdir -p "$(dirname "$CF_CRED_FILE")"
-    echo "dns_cloudflare_api_token = ${DEFAULT_CF_TOKEN}" > "$CF_CRED_FILE"
+    echo "dns_cloudflare_api_token = ${token}" > "$CF_CRED_FILE"
     chmod 600 "$CF_CRED_FILE"
   fi
 
@@ -391,7 +343,7 @@ issue_certificate() {
     cert_cmd+=(
       "--dns-cloudflare"
       "--dns-cloudflare-credentials" "/etc/letsencrypt/cloudflare.ini"
-      "--dns-cloudflare-propagation-seconds" "20"
+      "--dns-cloudflare-propagation-seconds" "60"
     )
   else
     log_info "Usando validación HTTP-01 (Requiere nube gris en Cloudflare)..."
@@ -410,7 +362,7 @@ issue_certificate() {
 cmd_install() {
   local LE_EMAIL=""
   local OPTIND opt
-  local CF_TOKEN="${DEFAULT_CF_TOKEN}"
+  local CF_TOKEN=""
   while getopts ":e:b:t:h" opt; do
     case "$opt" in
       e) LE_EMAIL="$OPTARG" ;;
@@ -418,9 +370,6 @@ cmd_install() {
       t) CF_TOKEN="$OPTARG" ;;
       h) cat <<EOF
 Uso: sudo $0 install -e <email-letsencrypt> [-t <cloudflare_token>] [-b <directorio-base>]
-  -e   Email por defecto para el registro ACME de Let's Encrypt (obligatorio)
-  -t   Token de API de Cloudflare para validación DNS (opcional pero recomendado)
-  -b   Directorio base de instalación (default: /opt/reverse-proxy)
 EOF
          exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
@@ -466,9 +415,6 @@ EOF
     log_ok "Docker instalado correctamente."
   fi
 
-  docker compose version &>/dev/null || die "El plugin 'docker compose' (v2) no está disponible."
-  docker info &>/dev/null || die "Docker no está operativo."
-
   log_info "Creando estructura de directorios en ${BASE_DIR}..."
   mkdir -p "${BASE_DIR}/nginx/certs" "${BASE_DIR}/nginx/conf.d" "${BASE_DIR}/nginx/vhost.d" \
            "${BASE_DIR}/nginx/html/.well-known/acme-challenge" "${BASE_DIR}/nginx/certbot" \
@@ -491,14 +437,11 @@ EOF
     docker network create "${NETWORK_NAME}"
   fi
 
-  # Migración segura desde una instalación anterior con acme-companion.
-  # Solo se retira el contenedor obsoleto; no se toca ninguna app ni volumen.
   if docker inspect nginx-proxy-acme >/dev/null 2>&1; then
-    log_info "Retirando el contenedor antiguo 'nginx-proxy-acme'..."
     docker rm -f nginx-proxy-acme >/dev/null 2>&1 || true
   fi
 
-  log_info "Generando docker-compose.yml de NGINX + almacenamiento Certbot..."
+  log_info "Generando docker-compose.yml de NGINX..."
   cat > "${BASE_DIR}/docker-compose.yml" <<EOF
 services:
   nginx-proxy:
@@ -529,26 +472,16 @@ EOF
   reload_nginx
   setup_renewal_timer
 
-  docker run --rm "${CERTBOT_IMAGE}" --version
   log_ok "¡Proxy inverso NGINX instalado y corriendo!"
-  echo
-  echo "--------------------------------------------------------------"
-  echo " Directorio de instalación : ${BASE_DIR}"
-  echo " Red Docker compartida     : ${NETWORK_NAME}"
-  echo " Email Let's Encrypt       : ${LE_EMAIL}"
-  echo " Emisor ACME               : Certbot (${CERTBOT_IMAGE})"
-  echo "--------------------------------------------------------------"
-  echo
-  echo "Siguiente paso: sudo $0 add -n <app> -H <dominio> -p <puerto> -m <email> -i <imagen>"
 }
 
 # ============================================================================
 # COMANDO: add
 # ============================================================================
 cmd_add() {
-  local APP_NAME="" DOMAIN="" PORT="" IMAGE="" EXISTING_CONTAINER="" LE_EMAIL="" ALIASES=""
+  local APP_NAME="" DOMAIN="" PORT="" IMAGE="" EXISTING_CONTAINER="" LE_EMAIL="" ALIASES="" CF_TOKEN=""
   local OPTIND opt
-  while getopts ":n:H:p:m:i:c:a:h" opt; do
+  while getopts ":n:H:p:m:i:c:a:k:h" opt; do
     case "$opt" in
       n) APP_NAME="$OPTARG" ;;
       H) DOMAIN="$OPTARG" ;;
@@ -557,30 +490,19 @@ cmd_add() {
       i) IMAGE="$OPTARG" ;;
       c) EXISTING_CONTAINER="$OPTARG" ;;
       a) ALIASES="$OPTARG" ;;
-      h) cat <<EOF
-Uso: sudo $0 add -n <app> -H <dominio> -p <puerto> [-m <email>] [-a <alias1,alias2,...>] (-i <imagen> | -c <contenedor-existente>)
-  -n   Nombre corto/identificador de la app
-  -H   Dominio o subdominio PRINCIPAL
-  -p   Puerto interno del backend
-  -m   Email para Let's Encrypt (opcional; usa el de install si se omite)
-  -a   Dominios/subdominios ADICIONALES separados por coma. Se incluyen como SAN.
-  -i   Imagen Docker a desplegar (crea un contenedor nuevo)
-  -c   Nombre de un contenedor Docker YA EXISTENTE a conectar a la red proxy
-EOF
-         exit 0 ;;
+      k) CF_TOKEN="$OPTARG" ;;
+      h) exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
       :) die "La opción -$OPTARG requiere un argumento." ;;
     esac
   done
 
-  [[ -z "$APP_NAME" ]] && die "Falta -n (nombre de app). Usa: $0 add -h"
-  [[ -z "$DOMAIN" ]] && die "Falta -H (dominio). Usa: $0 add -h"
-  [[ -z "$PORT" ]] && die "Falta -p (puerto). Usa: $0 add -h"
+  [[ -z "$APP_NAME" ]] && die "Falta -n (nombre de app)."
+  [[ -z "$DOMAIN" ]] && die "Falta -H (dominio)."
+  [[ -z "$PORT" ]] && die "Falta -p (puerto)."
   [[ -n "$IMAGE" && -n "$EXISTING_CONTAINER" ]] && die "Indica solo -i o -c, no ambos."
-  [[ -z "$IMAGE" && -z "$EXISTING_CONTAINER" ]] && die "Debes indicar -i (imagen) o -c (contenedor existente)."
+  [[ -z "$IMAGE" && -z "$EXISTING_CONTAINER" ]] && die "Debes indicar -i (imagen) o -c (contenedor)."
   require_root
-  [[ -f "${BASE_DIR}/docker-compose.yml" ]] || die "El proxy no está instalado. Ejecuta primero: sudo $0 install -e <email>"
-  docker network inspect "${NETWORK_NAME}" &>/dev/null || die "La red '${NETWORK_NAME}' no existe. Ejecuta 'install' primero."
 
   if [[ -z "$LE_EMAIL" ]]; then
     [[ -f "${BASE_DIR}/.state/default_email" ]] || die "No hay email por defecto. Indícalo con -m."
@@ -590,41 +512,24 @@ EOF
 
   local _domain_regex='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
   [[ "$DOMAIN" =~ $_domain_regex ]] || die "El dominio '${DOMAIN}' no tiene un formato válido."
-  [[ "$PORT" =~ ^[0-9]+$ ]] || die "El puerto '${PORT}' debe ser numérico."
-
+  
   local ALL_HOSTS="$DOMAIN"
   if [[ -n "$ALIASES" ]]; then
     IFS=',' read -ra _alias_arr <<< "$ALIASES"
     for a in "${_alias_arr[@]}"; do
       a="$(echo "$a" | xargs)"
       [[ -z "$a" ]] && continue
-      [[ "$a" =~ $_domain_regex ]] || die "El alias '${a}' no tiene un formato de dominio válido."
-      [[ "$a" == "$DOMAIN" ]] && die "El alias '${a}' duplica el dominio principal."
       ALL_HOSTS="${ALL_HOSTS},${a}"
     done
   fi
 
   local APP_ID
   APP_ID="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
-  [[ -z "$APP_ID" ]] && die "El nombre de app resultó vacío tras sanitizar."
-  [[ -n "$(state_get "$APP_ID")" ]] && die "Ya existe una app registrada con el id '${APP_ID}'. Usa 'remove' primero o elige otro nombre."
-
-  # Evita reutilizar un dominio/alias que ya pertenece a otra publicación.
-  while IFS=$'\t' read -r id domain port tipo ref aliases; do
-    [[ -z "$id" ]] && continue
-    local existing_hosts="$(all_hosts "$domain" "$aliases")"
-    IFS=',' read -ra eh <<< "$existing_hosts"
-    IFS=',' read -ra nh <<< "$ALL_HOSTS"
-    for x in "${eh[@]}"; do for y in "${nh[@]}"; do
-      [[ "$(echo "$x" | xargs)" == "$(echo "$y" | xargs)" ]] && die "El dominio '${y}' ya está asignado a la app '${id}'."
-    done; done
-  done < "$STATE_FILE"
-
+  
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   mkdir -p "$APP_DIR"
 
   if [[ -n "$EXISTING_CONTAINER" ]]; then
-    docker inspect "$EXISTING_CONTAINER" &>/dev/null || die "El contenedor '${EXISTING_CONTAINER}' no existe."
     log_info "Conectando '${EXISTING_CONTAINER}' a la red '${NETWORK_NAME}'..."
     docker network connect "${NETWORK_NAME}" "${EXISTING_CONTAINER}" 2>/dev/null || true
     state_add "$APP_ID" "$DOMAIN" "$PORT" "existente" "$EXISTING_CONTAINER" "${ALIASES:--}"
@@ -650,7 +555,8 @@ EOF
   reload_nginx
   log_info "Esperando a que el backend sea accesible antes del desafío ACME..."
   sleep 2
-  if ! issue_certificate "$DOMAIN" "$ALIASES" "$LE_EMAIL"; then
+  
+  if ! issue_certificate "$DOMAIN" "$ALIASES" "$LE_EMAIL" "$CF_TOKEN"; then
     log_err "Certbot no pudo emitir el certificado. El backend y la publicación se conservan."
     generate_nginx_config
     reload_nginx || true
@@ -659,10 +565,7 @@ EOF
 
   generate_nginx_config
   reload_nginx
-  log_ok "Dominio '${ALL_HOSTS}' publicado mediante HTTPS sin puerto."
-  log_ok "NGINX recibe 80/443 y reenvía internamente a '${EXISTING_CONTAINER:-$APP_ID}:${PORT}'."
-  echo "URL pública: https://${DOMAIN}/"
-  echo "El certificado SSL es administrado por Certbot y Let's Encrypt."
+  log_ok "Dominio '${ALL_HOSTS}' publicado mediante HTTPS."
 }
 
 # ============================================================================
@@ -674,18 +577,17 @@ cmd_remove() {
   while getopts ":n:h" opt; do
     case "$opt" in
       n) APP_NAME="$OPTARG" ;;
-      h) echo "Uso: sudo $0 remove -n <app>"; exit 0 ;;
+      h) exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
       :) die "La opción -$OPTARG requiere un argumento." ;;
     esac
   done
-  [[ -z "$APP_NAME" ]] && die "Falta -n (nombre de app). Usa: $0 remove -h"
+  [[ -z "$APP_NAME" ]] && die "Falta -n (nombre de app)."
   require_root
 
   local APP_ID; APP_ID="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
   local RECORD; RECORD="$(state_get "$APP_ID")"
-  [[ -z "$RECORD" ]] && die "No hay ninguna app registrada con id '${APP_ID}'. Usa: $0 list"
-
+  
   local APP_DIR="${BASE_DIR}/apps/${APP_ID}"
   local TIPO; TIPO="$(echo "$RECORD" | cut -f4)"
   local DOMAIN; DOMAIN="$(echo "$RECORD" | cut -f2)"
@@ -695,15 +597,11 @@ cmd_remove() {
 
   if [[ -f "${APP_DIR}/docker-compose.yml" ]]; then
     if [[ "$TIPO" == "nuevo" ]]; then
-      log_info "Deteniendo y eliminando el contenedor '${APP_ID}'..."
-      (cd "$APP_DIR" && docker compose down -v) || log_warn "No se pudo bajar limpiamente; continúo con la limpieza."
+      (cd "$APP_DIR" && docker compose down -v) || true
     elif [[ "$TIPO" == "redirect" ]]; then
-      log_info "La redirección se gestiona directamente desde NGINX; no se elimina ningún backend existente."
       (cd "$APP_DIR" && docker compose down -v) || true
     else
       local CONTENEDOR; CONTENEDOR="$(echo "$RECORD" | cut -f5)"
-      log_warn "El contenedor original '${CONTENEDOR}' NO será eliminado ni recreado."
-      log_info "Desconectando '${CONTENEDOR}' de la red '${NETWORK_NAME}'..."
       docker network disconnect "${NETWORK_NAME}" "$CONTENEDOR" 2>/dev/null || true
     fi
   elif [[ "$TIPO" == "existente" ]]; then
@@ -716,9 +614,6 @@ cmd_remove() {
   rm -rf "$APP_DIR"
 
   log_ok "Publicación '${APP_ID}' eliminada completamente del proxy."
-  log_ok "Dominio(s) liberado(s): ${HOSTS}"
-  [[ "$TIPO" == "existente" ]] && log_ok "El contenedor original se conserva intacto, junto con sus datos."
-  log_ok "El dominio puede volver a utilizarse."
 }
 
 # ============================================================================
@@ -727,7 +622,7 @@ cmd_remove() {
 cmd_list() {
   ensure_state_file
   if [[ ! -s "$STATE_FILE" ]]; then
-    log_info "No hay apps publicadas todavía. Usa: $0 add -h"
+    log_info "No hay apps publicadas todavía."
     return 0
   fi
   printf "%-15s %-30s %-8s %-10s %-20s %s\n" "APP" "DOMINIO" "PUERTO" "TIPO" "REFERENCIA" "ALIASES"
@@ -765,11 +660,7 @@ cmd_logs() {
   while getopts ":n:h" opt; do
     case "$opt" in
       n) TARGET="$OPTARG" ;;
-      h) cat <<EOF
-Uso: sudo $0 logs [-n proxy|certbot|<app>]
-  -n   'proxy' (default), 'certbot' o id de app
-EOF
-         exit 0 ;;
+      h) exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
       :) die "La opción -$OPTARG requiere un argumento." ;;
     esac
@@ -778,11 +669,10 @@ EOF
     proxy) docker logs -f --tail 100 nginx-proxy ;;
     certbot)
       local logfile="${BASE_DIR}/nginx/logs/letsencrypt.log"
-      [[ -f "$logfile" ]] || die "Todavía no existe el log de Certbot en ${logfile}."
+      [[ -f "$logfile" ]] || die "Todavía no existe el log de Certbot."
       tail -f "$logfile" ;;
     *)
       local RECORD; RECORD="$(state_get "$TARGET")"
-      [[ -z "$RECORD" ]] && die "No hay app '${TARGET}' registrada. Usa: $0 list"
       local tipo cname; tipo="$(echo "$RECORD" | cut -f4)"; cname="$TARGET"
       [[ "$tipo" == "existente" ]] && cname="$(echo "$RECORD" | cut -f5)"
       docker logs -f --tail 100 "$cname"
@@ -799,11 +689,7 @@ cmd_certs() {
   while getopts ":n:h" opt; do
     case "$opt" in
       n) TARGET="$OPTARG" ;;
-      h) cat <<EOF
-Uso: sudo $0 certs [-n <app>|all]
-  -n   id de una app publicada, o 'all' (default)
-EOF
-         exit 0 ;;
+      h) exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
       :) die "La opción -$OPTARG requiere un argumento." ;;
     esac
@@ -814,9 +700,8 @@ EOF
   _print_cert_row() {
     local domain="$1"
     local crt="${BASE_DIR}/nginx/certbot/live/${domain}/fullchain.pem"
-    [[ -f "$crt" ]] || { printf "  %-35s %s\n" "$domain" "certificado no encontrado (¿aún emitiéndose o falló?)"; return; }
+    [[ -f "$crt" ]] || { printf "  %-35s %s\n" "$domain" "certificado no encontrado"; return; }
     local end_date; end_date="$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)"
-    [[ -n "$end_date" ]] || { printf "  %-35s %s\n" "$domain" "no se pudo leer el certificado"; return; }
     local end_epoch now_epoch days_left
     end_epoch="$(date -d "$end_date" +%s 2>/dev/null || echo 0)"; now_epoch="$(date +%s)"
     days_left=$(( (end_epoch - now_epoch) / 86400 ))
@@ -826,12 +711,11 @@ EOF
   }
 
   if [[ "$TARGET" == "all" ]]; then
-    [[ -s "$STATE_FILE" ]] || { log_info "No hay apps publicadas todavía."; return 0; }
     log_info "Estado de certificados:"
     while IFS=$'\t' read -r id domain port tipo ref aliases; do _print_cert_row "$domain"; done < "$STATE_FILE"
   else
     local APP_ID; APP_ID="$(echo "${TARGET}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
-    local RECORD; RECORD="$(state_get "$APP_ID")"; [[ -n "$RECORD" ]] || die "No hay app '${APP_ID}' registrada. Usa: $0 list"
+    local RECORD; RECORD="$(state_get "$APP_ID")"
     local domain; domain="$(echo "$RECORD" | cut -f2)"
     log_info "Estado de certificado para '${APP_ID}' (${domain}):"; _print_cert_row "$domain"
   fi
@@ -843,36 +727,27 @@ cmd_renew() {
   while getopts ":n:h" opt; do
     case "$opt" in
       n) TARGET="$OPTARG" ;;
-      h) cat <<EOF
-Uso: sudo $0 renew -n <app>|all
-  -n   id de una app publicada, o 'all' para renovar certificados administrados por Certbot
-EOF
-         exit 0 ;;
+      h) exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
       :) die "La opción -$OPTARG requiere un argumento." ;;
     esac
   done
-  [[ -n "$TARGET" ]] || die "Falta -n <app>|all. Usa: $0 renew -h"
   require_root
-  [[ -d "${BASE_DIR}/nginx/certbot" ]] || die "El proxy no está instalado."
 
   if [[ "$TARGET" == "all" ]]; then
-    log_info "Forzando renovación de certificados administrados por Certbot..."
     certbot_run renew --non-interactive --force-renewal
   else
     local APP_ID; APP_ID="$(echo "${TARGET}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
-    local RECORD; RECORD="$(state_get "$APP_ID")"; [[ -n "$RECORD" ]] || die "No hay app '${APP_ID}' registrada. Usa: $0 list"
+    local RECORD; RECORD="$(state_get "$APP_ID")"
     local domain; domain="$(echo "$RECORD" | cut -f2)"
-    log_info "Forzando renovación de '${domain}'..."
     certbot_run renew --cert-name "$(certbot_cert_name "$domain")" --force-renewal --non-interactive
   fi
 
   generate_nginx_config
   reload_nginx
-  log_ok "Renovación/proceso de certificados completado y NGINX recargado."
+  log_ok "Renovación completada y NGINX recargado."
 }
 
-# Renovación automática equivalente a la función del acme-companion.
 setup_renewal_timer() {
   local runner="/usr/local/sbin/reverse-proxy-certbot-renew"
   local timer="/etc/systemd/system/reverse-proxy-certbot-renew.service"
@@ -895,7 +770,7 @@ EOF
 
   cat > "$timer" <<EOF
 [Unit]
-Description=Renovacion de certificados Certbot para reverse-proxy
+Description=Renovacion de certificados Certbot
 After=docker.service
 Requires=docker.service
 
@@ -905,7 +780,7 @@ ExecStart=${runner}
 EOF
   cat > "$unit" <<EOF
 [Unit]
-Description=Timer de renovacion Certbot para reverse-proxy
+Description=Timer de renovacion Certbot
 
 [Timer]
 OnCalendar=*-*-* 00,12:00:00
@@ -917,55 +792,38 @@ WantedBy=timers.target
 EOF
   systemctl daemon-reload
   systemctl enable --now reverse-proxy-certbot-renew.timer
-  log_ok "Renovación automática configurada con systemd timer."
 }
 
 # ============================================================================
 # COMANDO: redirect
 # ============================================================================
 cmd_redirect() {
-  local APP_NAME="" DOMAIN="" TARGET_URL="" LE_EMAIL=""
+  local APP_NAME="" DOMAIN="" TARGET_URL="" LE_EMAIL="" CF_TOKEN=""
   local OPTIND opt
-  while getopts ":n:H:t:m:h" opt; do
+  while getopts ":n:H:t:m:k:h" opt; do
     case "$opt" in
       n) APP_NAME="$OPTARG" ;;
       H) DOMAIN="$OPTARG" ;;
       t) TARGET_URL="$OPTARG" ;;
       m) LE_EMAIL="$OPTARG" ;;
-      h) cat <<EOF
-Uso: sudo $0 redirect -n <app> -H <dominio-origen> -t <url-destino> [-m <email>]
-  -n   Nombre corto/identificador
-  -H   Dominio o subdominio que va a redirigir
-  -t   URL completa de destino
-  -m   Email para Let's Encrypt (opcional; usa el de install si se omite)
-EOF
-         exit 0 ;;
+      k) CF_TOKEN="$OPTARG" ;;
+      h) exit 0 ;;
       \?) die "Opción inválida: -$OPTARG" ;;
       :) die "La opción -$OPTARG requiere un argumento." ;;
     esac
   done
-  [[ -z "$APP_NAME" ]] && die "Falta -n (nombre de app). Usa: $0 redirect -h"
-  [[ -z "$DOMAIN" ]] && die "Falta -H (dominio origen). Usa: $0 redirect -h"
-  [[ -z "$TARGET_URL" ]] && die "Falta -t (URL destino). Usa: $0 redirect -h"
-  [[ "$TARGET_URL" =~ ^https?:// ]] || die "La URL destino debe comenzar por http:// o https://"
-  [[ "$TARGET_URL" != *$'\n'* && "$TARGET_URL" != *$'\r'* && "$TARGET_URL" != *';'* && "$TARGET_URL" != *'{'* && "$TARGET_URL" != *'}'* ]] || die "La URL destino contiene caracteres no permitidos."
+  
   require_root
-  [[ -f "${BASE_DIR}/docker-compose.yml" ]] || die "El proxy no está instalado."
 
   if [[ -z "$LE_EMAIL" ]]; then
-    [[ -f "${BASE_DIR}/.state/default_email" ]] || die "No se indicó -m y no hay email por defecto."
     LE_EMAIL="$(cat "${BASE_DIR}/.state/default_email")"
   fi
-  local _domain_regex='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
-  [[ "$DOMAIN" =~ $_domain_regex ]] || die "El dominio '${DOMAIN}' no tiene un formato válido."
   local APP_ID; APP_ID="$(echo "${APP_NAME}" | tr -cd 'a-zA-Z0-9_-' | tr '[:upper:]' '[:lower:]')"
-  [[ -n "$APP_ID" ]] || die "El nombre de app resultó vacío tras sanitizar."
-  [[ -z "$(state_get "$APP_ID")" ]] || die "Ya existe una app/registro con el id '${APP_ID}'. Usa 'remove' primero."
 
   state_add "$APP_ID" "$DOMAIN" "80" "redirect" "$TARGET_URL" "-"
   generate_nginx_config
   reload_nginx
-  if ! issue_certificate "$DOMAIN" "-" "$LE_EMAIL"; then
+  if ! issue_certificate "$DOMAIN" "-" "$LE_EMAIL" "$CF_TOKEN"; then
     state_remove_silent "$APP_ID"
     generate_nginx_config
     reload_nginx || true
@@ -973,8 +831,7 @@ EOF
   fi
   generate_nginx_config
   reload_nginx
-  log_ok "Listo. Todo el tráfico a '${DOMAIN}' será redirigido (301) a '${TARGET_URL}'."
-  echo "El certificado SSL para '${DOMAIN}' es gestionado por Certbot."
+  log_ok "Tráfico a '${DOMAIN}' redirigido a '${TARGET_URL}'."
 }
 
 # ============================================================================
@@ -982,16 +839,12 @@ EOF
 # ============================================================================
 cmd_uninstall() {
   require_root
-  [[ -f "${BASE_DIR}/docker-compose.yml" ]] || die "El proxy no parece estar instalado en ${BASE_DIR}."
-  log_warn "Esto detendrá y eliminará NGINX."
-  log_warn "Las apps publicadas (en ${BASE_DIR}/apps) NO se eliminan."
   read -r -p "¿Continuar? [y/N]: " CONFIRM
-  [[ "$CONFIRM" =~ ^[Yy]$ ]] || { log_info "Cancelado."; exit 0; }
+  [[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 0
   systemctl disable --now reverse-proxy-certbot-renew.timer 2>/dev/null || true
   rm -f /etc/systemd/system/reverse-proxy-certbot-renew.timer /etc/systemd/system/reverse-proxy-certbot-renew.service
   systemctl daemon-reload
   (cd "${BASE_DIR}" && docker compose down)
-  log_ok "NGINX detenido y contenedor eliminado. Los certificados/configuración siguen en ${BASE_DIR}."
 }
 
 # ============================================================================
@@ -1032,8 +885,7 @@ interactive_menu() {
         read -rp "Email para Let's Encrypt (obligatorio): " EMAIL
         [[ -z "$EMAIL" ]] && { log_warn "El email es obligatorio."; _pause; continue; }
         read -rp "Directorio base [Enter = ${BASE_DIR}]: " BDIR
-        read -rp "Token API Cloudflare (Enter para usar el token integrado): " TOKEN_CF
-        [[ -z "$TOKEN_CF" ]] && TOKEN_CF="$DEFAULT_CF_TOKEN"
+        read -rp "Token API Cloudflare (opcional, dejalo en blanco si prefieres pedirlo por app): " TOKEN_CF
         ARGS=(-e "$EMAIL"); [[ -n "$BDIR" ]] && ARGS+=(-b "$BDIR")
         [[ -n "$TOKEN_CF" ]] && ARGS+=(-t "$TOKEN_CF")
         _run_safe cmd_install "${ARGS[@]}"
@@ -1048,9 +900,15 @@ interactive_menu() {
         echo "  a) Un contenedor NUEVO (a partir de una imagen)"
         echo "  b) Un contenedor YA EXISTENTE"
         read -rp "Elige a/b: " TIPO_SEL
+        
+        # Nueva pregunta para solicitar el Token aquí
+        read -rp "Token API Cloudflare (Pégalo aquí para DNS-01, o Enter para HTTP-01): " ADD_CF_TOKEN
+
         ARGS=(-n "$APP_N" -H "$DOM" -p "$PRT")
         [[ -n "$MAIL" ]] && ARGS+=(-m "$MAIL")
         [[ -n "$ALIAS" ]] && ARGS+=(-a "$ALIAS")
+        [[ -n "$ADD_CF_TOKEN" ]] && ARGS+=(-k "$ADD_CF_TOKEN")
+
         if [[ "$TIPO_SEL" == "a" ]]; then
           read -rp "Imagen Docker (ej: wordpress:latest): " IMG; ARGS+=(-i "$IMG")
         elif [[ "$TIPO_SEL" == "b" ]]; then
@@ -1065,7 +923,11 @@ interactive_menu() {
         read -rp "Dominio de origen (ej: viejo.midominio.com): " DOM
         read -rp "URL destino completa (ej: https://nuevo.midominio.com): " DEST
         read -rp "Email Let's Encrypt [Enter = usar el de install]: " MAIL
-        ARGS=(-n "$APP_N" -H "$DOM" -t "$DEST"); [[ -n "$MAIL" ]] && ARGS+=(-m "$MAIL")
+        read -rp "Token API Cloudflare (Pégalo aquí para DNS-01, o Enter para HTTP-01): " REDIR_CF_TOKEN
+        
+        ARGS=(-n "$APP_N" -H "$DOM" -t "$DEST")
+        [[ -n "$MAIL" ]] && ARGS+=(-m "$MAIL")
+        [[ -n "$REDIR_CF_TOKEN" ]] && ARGS+=(-k "$REDIR_CF_TOKEN")
         _run_safe cmd_redirect "${ARGS[@]}"
         ;;
       4) _run_safe cmd_list ;;
@@ -1073,7 +935,7 @@ interactive_menu() {
       6)
         read -rp "¿Logs de qué? [proxy/certbot/<id-de-app>] (Enter = proxy): " TARGET
         ARGS=(); [[ -n "$TARGET" ]] && ARGS+=(-n "$TARGET")
-        echo "(Ctrl+C para dejar de ver los logs y volver al menú)"; _run_safe cmd_logs "${ARGS[@]}"
+        _run_safe cmd_logs "${ARGS[@]}"
         ;;
       7)
         read -rp "¿Certificado de qué app? [Enter = todos]: " TARGET
@@ -1081,27 +943,22 @@ interactive_menu() {
         ;;
       8)
         read -rp "¿Renovar cuál app? (o escribe 'all' para todas): " TARGET
-        [[ -z "$TARGET" ]] && { log_warn "Debes indicar una app o 'all'."; _pause; continue; }
+        [[ -z "$TARGET" ]] && continue
         _run_safe cmd_renew -n "$TARGET"
         ;;
       9)
         read -rp "Id de la app/redirección a eliminar: " APP_N
-        [[ -z "$APP_N" ]] && { log_warn "Debes indicar un id."; _pause; continue; }
-        read -rp "¿Confirmas eliminar '${APP_N}'? [y/N]: " CONF
-        [[ "$CONF" =~ ^[Yy]$ ]] || { log_info "Cancelado."; _pause; continue; }
+        [[ -z "$APP_N" ]] && continue
         _run_safe cmd_remove -n "$APP_N"
         ;;
       10) _run_safe cmd_uninstall ;;
-      0) log_info "Hasta luego."; exit 0 ;;
+      0) exit 0 ;;
       *) log_warn "Opción no reconocida." ;;
     esac
     _pause
   done
 }
 
-# ============================================================================
-# DISPATCH PRINCIPAL
-# ============================================================================
 if [[ $# -lt 1 ]]; then
   interactive_menu
   exit 0
